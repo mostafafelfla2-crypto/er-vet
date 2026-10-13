@@ -98,12 +98,14 @@ export function UploadCenter({ onUploaded }: UploadCenterProps) {
       });
       const data = await res.json();
       if (!res.ok) {
-        const key =
-          data.error === "invalid_excel"
-            ? "admin.invalidExcel"
-            : data.error === "invalid_format"
-              ? "admin.invalidExcel"
-              : "admin.uploadError";
+        let key = "admin.uploadError";
+        if (data.error === "invalid_excel" || data.error === "invalid_format") {
+          key = "admin.invalidExcel";
+        } else if (data.error === "missing_file") {
+          key = "admin.uploadError";
+        } else if (data.error === "missing_exam_name") {
+          key = "admin.uploadError";
+        }
         setError(t(key as never));
         return;
       }

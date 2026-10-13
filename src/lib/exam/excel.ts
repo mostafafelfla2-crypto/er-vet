@@ -25,8 +25,153 @@ export interface ParsedSheet {
 
 /**
  * Parse an Excel buffer (uploaded file or file read from disk) into structured
- * student rows. The first row is treated as a header and skipped.
+ * student rows. Column detection is automatic: if the first row contains
+ * recognized header keywords (name/email/grade, in Arabic or English) those are
+ * used; otherwise the parser inspects the data to find the email column by
+ * shape and infers the name/grade columns from there.
  */
+/** Header keywords used to auto-detect the email / name / grade columns. */
+const EMAIL_HEADERS = ["email", "e-mail", "البريد", "الايميل", "الإيميل", "بريد", "mail"];
+const NAME_HEADERS = ["name", "student", "student name", "الاسم", "اسم الطالب", "اسم"];
+const GRADE_HEADERS = [
+  "grade",
+  "score",
+  "mark",
+  "result",
+  "الدرجة",
+  "الدرجه",
+  "النتيجة",
+  "النتيجه",
+  "Mark",
+];
+
+function normalizeHeader(cell: unknown): string {
+  return (cell == null ? "" : String(cell)).trim().toLowerCase();
+}
+
+function isEmailLike(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
+/**
+ * Detect the column indices for name / email / grade.
+ *
+ * Strategy (most permissive first, so weirdly-formatted files still work):
+ *   1. If the first row looks like a header, match by keyword.
+ *   2. Otherwise, scan the data rows and pick the column that contains the
+ *      most email-shaped values as the email column. Then pick the first
+ *      non-numeric column as the name, and the first remaining column as the
+ *      grade.
+ *   3. Fall back to the canonical layout (0=name, 1=email, 2=grade).
+ */
+function detectColumns(matrix: unknown[][]): {
+  nameIdx: number;
+  emailIdx: number;
+  gradeIdx: number;
+  hasHeader: boolean;
+} {
+  const width = Math.max(...matrix.map((row) => row.length), 0);
+  if (width === 0) {
+    return { nameIdx: 0, emailIdx: 1, gradeIdx: 2, hasHeader: false };
+  }
+
+  // 1. Header-keyword detection.
+  const firstRow = (matrix[0] ?? []).map(normalizeHeader);
+  let emailIdx = firstRow.findIndex((h) => EMAIL_HEADERS.includes(h));
+  let nameIdx = firstRow.findIndex((h) => NAME_HEADERS.includes(h));
+  let gradeIdx = firstRow.findIndex((h) => GRADE_HEADERS.includes(h));
+
+  const hasHeader =
+    emailIdx !== -1 || nameIdx !== -1 || gradeIdx !== -1;
+
+  if (hasHeader) {
+    if (nameIdx === -1) nameIdx = 0;
+    if (emailIdx === -1) {
+      // Pick the first column that is not name/grade.
+      emailIdx = [0, 1, 2].find((i) => i !== nameIdx && i !== gradeIdx) ?? 1;
+    }
+    if (gradeIdx === -1) {
+      gradeIdx = [0, 1, 2].find((i) => i !== nameIdx && i !== emailIdx) ?? 2;
+    }
+    return { nameIdx, emailIdx, gradeIdx, hasHeader: true };
+  }
+
+  // 2. Content-based detection when there is no header.
+  const sample = matrix.slice(0, Math.min(20, matrix.length));
+  let bestEmailIdx = 1;
+  let bestEmailScore = 0;
+  for (let col = 0; col < width; col++) {
+    let score = 0;
+    for (const row of sample) {
+      const v = normalizeHeader(row[col]);
+      if (v && isEmailLike(v)) score++;
+    }
+    if (score > bestEmailScore) {
+      bestEmailScore = score;
+      bestEmailIdx = col;
+    }
+  }
+
+  // Among the remaining columns, classify each as "grade-like" (numeric or
+  // "score/total" pattern) or "name-like" (mostly text). Pick the strongest
+  // candidate for each so misordered columns are still detected correctly.
+  let detectedName = -1;
+  let detectedGrade = -1;
+  let bestNameScore = 0;
+  let bestGradeScore = 0;
+  for (let col = 0; col < width; col++) {
+    if (col === bestEmailIdx) continue;
+    let textCount = 0;
+    let gradeCount = 0;
+    for (const row of sample) {
+      const v = normalizeHeader(row[col]);
+      if (!v) continue;
+      if (isEmailLike(v)) continue;
+      // Grade-like: pure number, or "a/b", or ends with "%".
+      if (/^\d+(\.\d+)?$/.test(v) || /^\d+(\.\d+)?\s*\/\s*\d+(\.\d+)?$/.test(v) || /^\d+(\.\d+)?%?$/.test(v)) {
+        gradeCount++;
+      } else {
+        textCount++;
+      }
+    }
+    if (textCount > bestNameScore) {
+      bestNameScore = textCount;
+      detectedName = col;
+    }
+    if (gradeCount > bestGradeScore) {
+      bestGradeScore = gradeCount;
+      detectedGrade = col;
+    }
+  }
+
+  // Fallbacks when only one non-email column exists.
+  if (detectedName === -1) detectedName = bestEmailIdx === 0 ? 1 : 0;
+  if (detectedGrade === -1) {
+    for (let col = 0; col < width; col++) {
+      if (col !== bestEmailIdx && col !== detectedName) {
+        detectedGrade = col;
+        break;
+      }
+    }
+  }
+  // Avoid name == grade collision.
+  if (detectedName === detectedGrade) {
+    for (let col = 0; col < width; col++) {
+      if (col !== bestEmailIdx && col !== detectedName) {
+        detectedGrade = col;
+        break;
+      }
+    }
+  }
+
+  return {
+    nameIdx: detectedName,
+    emailIdx: bestEmailIdx,
+    gradeIdx: detectedGrade,
+    hasHeader: false,
+  };
+}
+
 export function parseExcelBuffer(buffer: ArrayBuffer | Buffer): ParsedSheet {
   const workbook = xlsx.read(buffer, { type: "buffer" });
   const firstSheetName = workbook.SheetNames[0];
@@ -44,11 +189,15 @@ export function parseExcelBuffer(buffer: ArrayBuffer | Buffer): ParsedSheet {
     return { rows: [], count: 0, headers: [] };
   }
 
-  const headers = (matrix[0] as unknown[])
-    .map((cell) => (cell == null ? "" : String(cell).trim()))
-    .filter((cell) => cell.length > 0);
+  const { nameIdx, emailIdx, gradeIdx, hasHeader } = detectColumns(matrix);
 
-  const dataRows = matrix.slice(1);
+  const headers = hasHeader
+    ? (matrix[0] as unknown[])
+        .map((cell) => (cell == null ? "" : String(cell).trim()))
+        .filter((cell) => cell.length > 0)
+    : [];
+
+  const dataRows = hasHeader ? matrix.slice(1) : matrix;
   const rows: StudentRow[] = [];
   for (const raw of dataRows) {
     const cells = (raw as unknown[]).map((cell) =>
@@ -56,10 +205,12 @@ export function parseExcelBuffer(buffer: ArrayBuffer | Buffer): ParsedSheet {
     );
     // Skip fully empty rows.
     if (cells.every((cell) => cell === "")) continue;
-    const name = cells[0] ?? "";
-    const email = cells[1] ?? "";
-    const grade = cells[2] ?? "";
-    const extras = cells.slice(3).filter((cell) => cell !== "");
+    const name = cells[nameIdx] ?? "";
+    const email = cells[emailIdx] ?? "";
+    const grade = cells[gradeIdx] ?? "";
+    const extras = cells
+      .map((c, i) => (i !== nameIdx && i !== emailIdx && i !== gradeIdx && c !== "" ? c : null))
+      .filter((c): c is string => c !== null);
     if (!email && !name && !grade) continue;
     rows.push({ name, email, grade, extras });
   }

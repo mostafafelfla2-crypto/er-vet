@@ -77,7 +77,12 @@ export async function POST(request: Request) {
     } catch (err) {
       if ((err as Error).message === "invalid-excel") {
         return NextResponse.json(
-          { error: "invalid_excel" },
+          {
+            error: "invalid_excel",
+            // Surfaced to the admin UI as a more actionable message.
+            detail:
+              "no_student_rows — ensure the sheet has at least one row with a name, an email-shaped value, and a grade.",
+          },
           { status: 400 },
         );
       }

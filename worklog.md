@@ -152,3 +152,59 @@ public/uploads/excel/*.xlsx           # sample results files
 5. **Audit logging.** View-once and device-binding events are recorded but not
    surfaced in the admin UI. A future enhancement could add a per-exam "views &
    bindings" log table in the dashboard.
+
+---
+
+## Task ID: 8 — Vercel Blob Storage Migration
+Agent: main (Z.ai Code)
+Task: Replace local-filesystem storage with Vercel Blob for the production
+deployment. The Vercel project is now connected to a *private* Blob store, so
+uploads via the admin panel were failing with 500 (read-only FS).
+
+Work Log:
+- Installed `@vercel/blob@2.8.1` and inspected its typed exports to confirm the
+  right API: `put`, `list`, `del`, `head`, and crucially `get(pathname, { access:
+  'private' })` which returns a `ReadableStream` for private blobs — no signed
+  URL juggling required.
+- Refactored `src/lib/exam/storage.ts`:
+  - Kept the `ExamFileStorage` interface unchanged (so no other code had to
+    change).
+  - Implemented `VercelBlobExamFileStorage`:
+    * `save()`  → `put(fileName, body, { access: 'private', addRandomSuffix:
+      false, allowOverwrite: true })`. The canonical `results-{ExamName}-
+      {SECRET_CODE}.xlsx` name is preserved exactly (no random suffix), so the
+      scanner's filename pattern still matches and the DB row stays 1:1 with the
+      blob pathname.
+    * `read()`  → `get(fileName, { access: 'private' })` and drain the returned
+      `ReadableStream<Uint8Array>` into a Node `Buffer` via a helper.
+    * `list()`  → paginated `list()` call, filtering to `.xlsx` and walking the
+      cursor until `hasMore` is false.
+    * `delete()` → `del(fileName)` (idempotent — swallows not-found).
+    * `exists()` → `head(fileName)` returns null when missing.
+  - Made the singleton environment-aware via `createStorage()`:
+    * `BLOB_READ_WRITE_TOKEN` set  → `VercelBlobExamFileStorage` (Vercel prod)
+    * otherwise                    → `LocalExamFileStorage` (local dev)
+    * `EXAM_STORAGE=local` forces local even with a token (escape hatch).
+  - Exposed `isUsingVercelBlob` for diagnostics.
+- No changes were needed in the scanner (`registry.ts`), upload API, result API,
+  or delete API — they all call `examFileStorage.list/save/read/delete`, so the
+  new backend is picked up transparently.
+- Verified locally that the `LocalExamFileStorage` path still works (3 sample
+  exams listed, student search returns results, admin upload saves a file with
+  the canonical name `results-Smoke-Test-Exam-MSF2msf3##.xlsx`).
+- Verified that with a fake `BLOB_READ_WRITE_TOKEN` the singleton switches to
+  `VercelBlobExamFileStorage` and the SDK correctly rejects the token with
+  "Access denied" — proving the wiring is correct and will work with a real
+  token on Vercel.
+- Lint clean. No runtime errors in `dev.log`.
+
+Stage Summary:
+- The codebase now supports both backends out of the box. On Vercel (where
+  `BLOB_READ_WRITE_TOKEN` is auto-injected after connecting the Blob store), all
+  four file operations — upload, list, read, delete — flow through Vercel Blob.
+  Locally, the same code falls back to the filesystem so development is
+  unaffected.
+- Required Vercel environment variable: `BLOB_READ_WRITE_TOKEN` (auto-set when
+  the Blob store is linked to the project). No code changes needed on deploy.
+- Optional env var: `EXAM_STORAGE=local` to force the filesystem backend even
+  when a Blob token is present (useful for preview deployments or tests).

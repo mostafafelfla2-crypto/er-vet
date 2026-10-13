@@ -142,7 +142,7 @@ export const translations = {
       expandConfig: "عرض الإعدادات",
       collapseConfig: "إخفاء الإعدادات",
       invalidExcel:
-        "الملف غير صالح. تأكد من أن العمود الأول يحتوي على الاسم، والثاني على البريد، والثالث على الدرجة.",
+        "الملف غير صالح أو لا يحتوي على بيانات طلاب. تأكد من أن الملف يحتوي على عمود للاسم وعمود للبريد الإلكتروني وعمود للدرجة. يمكن ترتيب الأعمدة بأي شكل — سيتم اكتشافها تلقائياً. لو أول صف هو عناوين الأعمدة استخدم كلمات مثل: Name / Email / Grade (أو الاسم / البريد / الدرجة).",
     },
     theme: {
       toggle: "تبديل المظهر",
@@ -290,7 +290,7 @@ export const translations = {
       expandConfig: "Show Settings",
       collapseConfig: "Hide Settings",
       invalidExcel:
-        "Invalid file. Ensure column 1 is name, column 2 is email, column 3 is grade.",
+        "Invalid file or no student rows detected. Ensure the sheet has a name column, an email column, and a grade column. Columns can be in any order — they are detected automatically. If the first row is a header, use keywords like: Name / Email / Grade.",
     },
     theme: {
       toggle: "Toggle theme",
