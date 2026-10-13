@@ -34,8 +34,10 @@ model Exam {
   slug      String   @unique
   /// Human readable name extracted from the file name.
   examName  String
-  /// Canonical stored file name, e.g. "results-Midterm-2024-MSF2msf3##.xlsx".
-  /// This is the pathname used inside the Vercel Blob store.
+  /// Canonical stored file name, e.g. "results-Midterm-2024-MSF2msf3.xlsx".
+  /// This is the pathname used inside the Vercel Blob store. The secret code
+  /// is intentionally URL-safe (no `#` characters) so it survives HTTP fetches
+  /// without being truncated as a URL fragment.
   fileName  String   @unique
   /// Display name shown to users (Arabic).
   displayNameAr String

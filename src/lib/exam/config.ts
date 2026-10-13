@@ -6,10 +6,16 @@
  * match the pattern `results-{ExamName}-{SECRET_CODE}.xlsx` to be detected as
  * a valid exam by the scanner.
  *
+ * IMPORTANT: the secret code must NOT contain URL-unsafe characters such as
+ * `#`, `?`, or `&`. Such characters are interpreted by HTTP clients/servers as
+ * URL fragments or query separators and silently truncate the pathname — which
+ * is exactly the 404 we hit when the code was `MSF2msf3##`. The code is now a
+ * plain alphanumeric token.
+ *
  * In production this should be moved to an environment variable.
  */
 export const RESULTS_SECRET_CODE =
-  process.env.RESULTS_SECRET_CODE ?? "MSF2msf3##";
+  process.env.RESULTS_SECRET_CODE ?? "MSF2msf3";
 
 /** Admin credentials (hardcoded as requested for this personal tool). */
 export const ADMIN_EMAIL = "mostafafelfla@mostafa.com";
@@ -31,9 +37,6 @@ export const EXCEL_PUBLIC_PREFIX = "/uploads/excel";
 /** A simple HMAC-style signing secret. In production use a real env var. */
 export const SESSION_SIGNING_SECRET =
   process.env.SESSION_SIGNING_SECRET ?? "msf-exam-portal-signing-secret-v1";
-
-/** File-name pattern: results-{ExamName}-{SECRET_CODE}.xlsx */
-export const RESULTS_FILE_PATTERN = / ^results-(.+)-([^.]+)\.xlsx$/i;
 
 /**
  * Build the canonical stored file name for an exam.

@@ -285,3 +285,57 @@ Stage Summary:
      `BLOB_READ_WRITE_TOKEN` is injected. If the 500 persists with an "Access
      denied" message, the store is not linked — re-link it in Vercel → Storage.
   3. Redeploy.
+
+---
+
+## Task ID: 10 — Remove `#` from secret code (Vercel Blob 404 fix)
+Agent: main (Z.ai Code)
+Task: The Vercel Blob download was returning 404 because the `#` characters in
+the file naming convention (`results-{Exam_Name}-MSF2msf3##.xlsx`) were being
+treated as URL fragments by HTTP fetch requests, truncating the pathname
+server-side. Remove the `#` characters from the secret code entirely so the
+new format is `results-{Exam_Name}-MSF2msf3.xlsx`.
+
+Work Log:
+- **Root cause**: `#` is the URL fragment delimiter. When the Vercel Blob SDK
+  (or any HTTP client) fetches a pathname containing `#`, everything from the
+  `#` onwards is stripped before the request reaches the server. The blob
+  `results-Midterm-2024-MSF2msf3##.xlsx` was therefore requested as
+  `results-Midterm-2024-MSF2msf3` → 404.
+- **`src/lib/exam/config.ts`**:
+  - Changed `RESULTS_SECRET_CODE` default from `"MSF2msf3##"` to `"MSF2msf3"`.
+  - Added a documentation comment explaining why the code must stay URL-safe
+    (no `#`, `?`, `&`).
+  - Removed the dead `RESULTS_FILE_PATTERN` constant (it had a leading-space
+    typo and was never imported).
+  - `buildResultsFileName` and `parseResultsFileName` were already
+    parameterised on `RESULTS_SECRET_CODE`, so they pick up the new code
+    automatically. Verified: `buildResultsFileName("Midterm 2024")` now
+    returns `results-Midterm-2024-MSF2msf3.xlsx`, and `parseResultsFileName`
+    accepts the new format while correctly **rejecting** any old `##` files
+    (returns `null`), so stale files won't be re-registered by the scanner.
+- **Sample files**: renamed the three existing `.xlsx` files on disk:
+  - `results-Final-2024-MSF2msf3##.xlsx`  → `results-Final-2024-MSF2msf3.xlsx`
+  - `results-Midterm-2024-MSF2msf3##.xlsx` → `results-Midterm-2024-MSF2msf3.xlsx`
+  - `results-Quiz-1-MSF2msf3##.xlsx`      → `results-Quiz-1-MSF2msf3.xlsx`
+- **UI instructions** (Upload Center): already rendered the secret code
+  dynamically from the `RESULTS_SECRET_CODE` constant, so the displayed
+  template now reads `results-{Exam Name}-MSF2msf3.xlsx` with no code change
+  needed. Verified there are no hardcoded `##` strings in any component or
+  translation dictionary.
+- **`prisma/schema.prisma`**: updated the `fileName` field doc comment to show
+  the new example and note the URL-safety rationale.
+- Admin login password (`Mostafa2msf3##`) was left unchanged — it is a login
+  credential, not a URL component, so the `#` is harmless there and changing it
+  would break the user's existing credentials.
+- Lint clean.
+
+Stage Summary:
+- The file naming convention is now `results-{Exam_Name}-MSF2msf3.xlsx` — fully
+  URL-safe. The Vercel Blob 404 caused by `#`-truncation is resolved.
+- The change is isolated to a single constant (`RESULTS_SECRET_CODE`); all
+  scanner logic, API routes, and UI instructions derive from it.
+- On Vercel: existing exams in the DB that still reference old `##` filenames
+  should be deleted via the admin panel (or the DB reset) so the scanner
+  re-registers them against the renamed blobs. New uploads will use the new
+  format automatically.
