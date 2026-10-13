@@ -1,25 +1,41 @@
 // Prisma schema for the dynamic multi-exam results portal.
-// SQLite is used for local development. In production on Vercel this can be
-// swapped for a hosted Postgres by changing the datasource provider/url.
+//
+// Database provider: PostgreSQL.
+// SQLite was used during early local development but is NOT supported inside
+// Vercel serverless functions (it requires a writable file on disk). The
+// project now targets Vercel Postgres.
+//
+// Local development: set DATABASE_URL to a local or cloud Postgres connection
+// string, e.g. postgresql://user:pass@localhost:5432/exam_portal
+//
+// Vercel production: set DATABASE_URL to the Vercel Postgres pooled connection
+// string. Prisma works with PgBouncer in transaction mode when
+// `?pgbouncer=true&connection_limit=1` is appended (Vercel Postgres pooler URLs
+// already enable this).
 
 generator client {
   provider = "prisma-client-js"
+  // Include the Linux/Debian target so the generated client works inside
+  // Vercel's serverless Node.js runtime (AWS Lambda), not just the local
+  // machine. "native" covers the developer's host OS for local dev.
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
 /// A single exam (one tab in the student UI). Each exam maps to one uploaded
-/// Excel file stored in /public/uploads/excel.
+/// Excel file stored in the Vercel Blob store under its canonical name.
 model Exam {
   id        String   @id @default(cuid())
   /// URL-friendly slug derived from the exam name, e.g. "midterm-2024".
   slug      String   @unique
   /// Human readable name extracted from the file name.
   examName  String
-  /// Original stored file name, e.g. "results-Midterm-2024-MSF2msf3##.xlsx".
+  /// Canonical stored file name, e.g. "results-Midterm-2024-MSF2msf3##.xlsx".
+  /// This is the pathname used inside the Vercel Blob store.
   fileName  String   @unique
   /// Display name shown to users (Arabic).
   displayNameAr String

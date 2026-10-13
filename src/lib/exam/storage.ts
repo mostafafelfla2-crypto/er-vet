@@ -235,16 +235,57 @@ async function streamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Buffe
 // Singleton selection
 // ---------------------------------------------------------------------------
 
+/**
+ * Select the storage backend.
+ *
+ * CRITICAL: on Vercel (production OR any preview deployment) the serverless
+ * filesystem is READ-ONLY. The local filesystem backend MUST NOT be used there
+ * — it crashes with `EROFS: read-only file system`. Therefore:
+ *
+ *   - When `NODE_ENV=production` OR the `VERCEL` env var is set, we ALWAYS
+ *     return the Vercel Blob backend. We do NOT fall back to local even if the
+ *     `BLOB_READ_WRITE_TOKEN` is missing — instead the Blob SDK itself will
+ *     raise a clear "Access denied" error, which is far easier to diagnose than
+ *     the EROFS crash that a silent local fallback would produce.
+ *
+ *   - In local development (no `VERCEL`, `NODE_ENV !== "production"`) we use
+ *     the filesystem by default for convenience, and switch to Blob when a
+ *     token is present or `EXAM_STORAGE=blob` is set (useful for testing
+ *     against the real store).
+ *
+ * Detection signals:
+ *   - `process.env.BLOB_READ_WRITE_TOKEN` — auto-injected by Vercel once a
+ *     Blob store is linked to the project. We treat empty string as "not set".
+ *   - `process.env.VERCEL` — set to `"1"` by Vercel for every deployment.
+ *   - `process.env.NODE_ENV` — `"production"` on Vercel prod.
+ */
 function createStorage(): ExamFileStorage {
-  // Prefer Vercel Blob whenever the token is present (i.e. on Vercel after the
-  // Blob store is connected, or locally if the dev exports the token).
-  if (process.env.BLOB_READ_WRITE_TOKEN) {
+  const isProduction = process.env.NODE_ENV === "production";
+  const isVercel = Boolean(process.env.VERCEL);
+  const hasBlobToken = Boolean(
+    process.env.BLOB_READ_WRITE_TOKEN &&
+      process.env.BLOB_READ_WRITE_TOKEN.trim().length > 0,
+  );
+
+  // --- Production / Vercel: Blob is MANDATORY (no local fallback) ----------
+  if (isProduction || isVercel) {
+    if (!hasBlobToken) {
+      // Fail loud and clear. We still return the Blob backend so that the
+      // error surfaced is a descriptive Blob SDK auth error rather than the
+      // confusing EROFS from a read-only filesystem write.
+      console.error(
+        "[storage] Production/Vercel environment detected but " +
+          "BLOB_READ_WRITE_TOKEN is not set. Connect a Vercel Blob store to " +
+          "the project. Refusing to fall back to the read-only local " +
+          "filesystem.",
+      );
+    }
     return new VercelBlobExamFileStorage();
   }
-  // Allow forcing the local implementation even if a token is present (handy
-  // for tests / offline development).
-  if (process.env.EXAM_STORAGE === "local") {
-    return new LocalExamFileStorage();
+
+  // --- Local development ---------------------------------------------------
+  if (process.env.EXAM_STORAGE === "blob" || hasBlobToken) {
+    return new VercelBlobExamFileStorage();
   }
   return new LocalExamFileStorage();
 }
@@ -253,6 +294,12 @@ function createStorage(): ExamFileStorage {
 export const examFileStorage: ExamFileStorage = createStorage();
 
 /** Whether the active storage backend is Vercel Blob. Exposed for diagnostics. */
-export const isUsingVercelBlob = process.env.BLOB_READ_WRITE_TOKEN
-  ? process.env.EXAM_STORAGE !== "local"
-  : false;
+export const isUsingVercelBlob =
+  process.env.NODE_ENV === "production" ||
+  Boolean(process.env.VERCEL) ||
+  (process.env.EXAM_STORAGE === "blob"
+    ? true
+    : Boolean(
+        process.env.BLOB_READ_WRITE_TOKEN &&
+          process.env.BLOB_READ_WRITE_TOKEN.trim().length > 0,
+      ) && process.env.EXAM_STORAGE !== "local");

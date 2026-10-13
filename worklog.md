@@ -208,3 +208,80 @@ Stage Summary:
   the Blob store is linked to the project). No code changes needed on deploy.
 - Optional env var: `EXAM_STORAGE=local` to force the filesystem backend even
   when a Blob token is present (useful for preview deployments or tests).
+
+---
+
+## Task ID: 9 — Vercel Production Crash Fixes (Postgres + Strict Blob)
+Agent: main (Z.ai Code)
+Task: Fix two 500 errors on Vercel: (1) Prisma using SQLite which is unsupported
+in serverless + missing DATABASE_URL; (2) storage still falling back to the
+read-only local filesystem (EROFS) in production.
+
+Work Log:
+- **Prisma → PostgreSQL**
+  - `prisma/schema.prisma`: changed `provider = "sqlite"` to
+    `provider = "postgresql"`. The model definitions were already
+    Postgres-compatible (cuid ids, Float, Boolean, @@unique, @@index).
+  - Added `binaryTargets = ["native", "debian-openssl-3.0.x"]` so the generated
+    client ships the binary for Vercel's AWS Lambda runtime (Debian) in addition
+    to the developer's host. Without this, Prisma throws "binary not found" at
+    runtime on Vercel even when the schema is correct.
+  - Ran `bun run db:generate` to regenerate the client against the postgres
+    provider.
+  - `src/lib/db.ts`: added a fail-fast guard at module load — if
+    `DATABASE_URL` is missing/empty, throw a clear actionable error
+    (`[db] DATABASE_URL is not set. Configure a Vercel Postgres...`) instead of
+    letting Prisma raise the cryptic "Environment variable not found" 500 later
+    inside a request handler. Also gated the query log to dev only
+    (production logs `error`/`warn` to keep serverless logs clean).
+- **Storage: no local fallback in production**
+  - Root cause of the EROFS crash: the previous `createStorage()` selected the
+    local filesystem whenever `BLOB_READ_WRITE_TOKEN` was falsy. On Vercel the
+    token is auto-injected only after the Blob store is properly linked; if for
+    any reason it is not propagated to the serverless function, the code
+    silently fell back to `LocalExamFileStorage`, which then tried to write to
+    the read-only filesystem and crashed.
+  - New logic in `src/lib/exam/storage.ts`:
+    * `isProduction = NODE_ENV === "production"`
+    * `isVercel = Boolean(process.env.VERCEL)` (Vercel sets this to "1" on every
+      deployment, including previews)
+    * `hasBlobToken` now also trims and rejects whitespace-only values (treats
+      empty string as "not set").
+    * If `isProduction || isVercel` → ALWAYS return `VercelBlobExamFileStorage`.
+      There is NO path back to `LocalExamFileStorage` in production. If the
+      token is missing we log a loud error but still return the Blob backend —
+      the Blob SDK then raises a clear "Access denied" which is far easier to
+      diagnose than the EROFS crash.
+    * Local dev unchanged: filesystem by default, Blob if a token is present or
+      `EXAM_STORAGE=blob` is set.
+  - Verified the selection matrix with 5 simulated-environment tests:
+    | NODE_ENV=production + VERCEL=1 + token  | VercelBlob ✅ |
+    | NODE_ENV=production + VERCEL=1, NO token | VercelBlob ✅ (no fallback) |
+    | VERCEL=1 only (preview)                  | VercelBlob ✅ |
+    | local dev (no signals)                   | Local ✅ (allowed) |
+    | whitespace-only token                    | VercelBlob ✅ (treated as missing) |
+- **`.env`** updated to document all required variables: `DATABASE_URL`
+  (Postgres placeholder), `BLOB_READ_WRITE_TOKEN` (commented, auto-injected on
+  Vercel), and the `EXAM_STORAGE` override for local testing.
+- Confirmed via grep that every `fs.*` call in the codebase lives inside
+  `LocalExamFileStorage` — no production code path touches the filesystem
+  directly.
+- Lint clean.
+
+Stage Summary:
+- Prisma now targets PostgreSQL with the correct Lambda binary target, so the
+  generated client runs on Vercel. `db.ts` fails fast with a clear message if
+  `DATABASE_URL` is not configured, preventing the "Environment variable not
+  found" 500.
+- Storage is now strictly Vercel Blob on Vercel (production + previews). The
+  EROFS crash is impossible because the local filesystem backend is never
+  selected when `NODE_ENV=production` or `VERCEL=1`.
+- Deploy checklist for the user:
+  1. In Vercel project settings → Environment Variables, ensure `DATABASE_URL`
+     is set to the Vercel Postgres connection string (the pooled one). Run
+     `prisma migrate deploy` or `prisma db push` against it once to create the
+     tables.
+  2. Confirm the Blob store is linked to the project so
+     `BLOB_READ_WRITE_TOKEN` is injected. If the 500 persists with an "Access
+     denied" message, the store is not linked — re-link it in Vercel → Storage.
+  3. Redeploy.
