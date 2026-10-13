@@ -1,0 +1,80 @@
+// Prisma schema for the dynamic multi-exam results portal.
+// SQLite is used for local development. In production on Vercel this can be
+// swapped for a hosted Postgres by changing the datasource provider/url.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// A single exam (one tab in the student UI). Each exam maps to one uploaded
+/// Excel file stored in /public/uploads/excel.
+model Exam {
+  id        String   @id @default(cuid())
+  /// URL-friendly slug derived from the exam name, e.g. "midterm-2024".
+  slug      String   @unique
+  /// Human readable name extracted from the file name.
+  examName  String
+  /// Original stored file name, e.g. "results-Midterm-2024-MSF2msf3##.xlsx".
+  fileName  String   @unique
+  /// Display name shown to users (Arabic).
+  displayNameAr String
+  /// Display name shown to users (English).
+  displayNameEn String
+  /// Optional override for the maximum score used to compute the percentage.
+  /// When null, the parser falls back to the denominator found in the grade cell.
+  maxScore  Float?
+  /// JSON string holding custom grade label bands, e.g.
+  /// [{"min":0,"max":60,"ar":"ضعيف","en":"Fail","color":"#e74c3c"}, ...]
+  gradeBandsJson String?
+  /// Optional WhatsApp/Telegram group link shown to passing students.
+  successGroupUrl String?
+  /// Minimum percentage (0-100) required to reveal the success group link.
+  successThreshold Float  @default(50)
+  /// Burn-after-read: a student may view their result only once per email.
+  viewOnceEnabled      Boolean @default(false)
+  /// Anti-sharing: once an email is searched on a device, it is locked to that
+  /// device's fingerprint and cannot be queried elsewhere.
+  deviceBindingEnabled Boolean @default(false)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  views    ViewLog[]
+  bindings DeviceBinding[]
+
+  @@index([slug])
+}
+
+/// Records that a given email has already viewed a given exam result.
+/// Used by the "view once" feature. One row per (exam, email).
+model ViewLog {
+  id       String   @id @default(cuid())
+  examId   String
+  email    String
+  /// Optional device fingerprint captured at view time (useful for forensics).
+  fingerprint String?
+  viewedAt DateTime @default(now())
+  exam     Exam     @relation(fields: [examId], references: [id], onDelete: Cascade)
+
+  @@unique([examId, email])
+  @@index([email])
+}
+
+/// Binds an email to a single device fingerprint for a given exam.
+/// Used by the "strict device binding" feature.
+model DeviceBinding {
+  id          String   @id @default(cuid())
+  examId      String
+  email       String
+  fingerprint String
+  boundAt     DateTime @default(now())
+  exam        Exam     @relation(fields: [examId], references: [id], onDelete: Cascade)
+
+  @@unique([examId, email])
+  @@index([email])
+}
