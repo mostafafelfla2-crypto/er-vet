@@ -343,17 +343,24 @@ export class SupabaseExamFileStorage implements ExamFileStorage {
   }
 
   async exists(fileName: string): Promise<boolean> {
-    // Supabase has no dedicated `head`/`exists` method. The cheapest way to
-    // check existence is `list` with a prefix filter — a single object name
-    // as the prefix returns at most one entry.
+    // Supabase has no dedicated `head`/`exists` method. We use `list` with
+    // an empty prefix (listing the bucket root) and a `search` option to
+    // filter by the exact filename. Using the filename as the *prefix*
+    // (the old approach) does NOT work — Supabase treats it as a folder
+    // path and returns an empty array for files.
     const pathName = this.sanitize(fileName);
-    const { data, error } = await this.getClient()
-      .storage.from(SUPABASE_BUCKET)
-      .list(pathName, { limit: 1 });
-    if (error) return false;
-    // When listing with a full filename as the prefix, Supabase returns the
-    // file itself (if it exists) or an empty array.
-    return Array.isArray(data) && data.some((f) => f.name === pathName);
+    try {
+      const { data, error } = await this.getClient()
+        .storage.from(SUPABASE_BUCKET)
+        .list("", {
+          limit: 100,
+          search: pathName,
+        });
+      if (error) return false;
+      return Array.isArray(data) && data.some((f) => f.name === pathName);
+    } catch {
+      return false;
+    }
   }
 
   /** Guard against path traversal — only the base name is used. */

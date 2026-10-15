@@ -28,155 +28,212 @@ interface ResultRequestBody {
  * Looks up a student's result for a specific exam and enforces the optional
  * security features (view once, device binding) configured per exam.
  *
- * Response codes:
- *   200 — result returned
- *   400 — bad request (missing/invalid fields)
- *   404 — exam or student not found
- *   409 — blocked by view-once or device-binding policy
+ * Every step is logged with console.error/console.log so the full diagnostic
+ * trail appears in Vercel function logs. The 404 responses include a `detail`
+ * field with context so the issue is identifiable from the network tab alone.
  */
 export async function POST(request: Request) {
+  const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   try {
     const body = (await request.json()) as ResultRequestBody;
     const email = (body.email ?? "").trim();
     const examId = (body.examId ?? "").trim();
 
+    console.log(`[POST /api/result ${requestId}] start — email="${email}" examId="${examId}"`);
+
     if (!email || !examId) {
+      console.log(`[POST /api/result ${requestId}] 400 missing_fields`);
       return NextResponse.json(
-        { error: "missing_fields" },
+        { error: "missing_fields", detail: "Both email and examId are required." },
         { status: 400 },
       );
     }
 
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
+      console.log(`[POST /api/result ${requestId}] 400 invalid_email`);
       return NextResponse.json(
-        { error: "invalid_email" },
+        { error: "invalid_email", detail: `"${email}" is not a valid email.` },
         { status: 400 },
       );
     }
 
+    // --- Step 1: Look up the exam -------------------------------------------
     const exam = await getExam(examId);
-    if (!exam || !exam.isActive) {
+    if (!exam) {
+      console.error(
+        `[POST /api/result ${requestId}] 404 exam_not_found — examId="${examId}" not in DB`,
+      );
       return NextResponse.json(
-        { error: "exam_not_found" },
+        {
+          error: "exam_not_found",
+          detail: `No exam with id/slug "${examId}" exists in the database.`,
+        },
         { status: 404 },
       );
     }
+    if (!exam.isActive) {
+      console.error(
+        `[POST /api/result ${requestId}] 404 exam_inactive — examId="${examId}" isActive=false`,
+      );
+      return NextResponse.json(
+        {
+          error: "exam_not_found",
+          detail: `Exam "${exam.displayNameEn}" is inactive.`,
+        },
+        { status: 404 },
+      );
+    }
+    console.log(
+      `[POST /api/result ${requestId}] exam found: id=${exam.id} fileName="${exam.fileName}"`,
+    );
 
     // Resolve the device fingerprint early (creates the cookie on first call).
     const fingerprint = await getOrCreateDeviceFingerprint();
 
-    // --- Strict device binding enforcement -----------------------------------
+    // --- Step 2: Device binding enforcement ---------------------------------
     if (exam.deviceBindingEnabled) {
       const boundFp = await getDeviceBinding(exam.id, email);
       if (boundFp && boundFp !== fingerprint) {
+        console.log(`[POST /api/result ${requestId}] 409 device_blocked`);
         return NextResponse.json(
           { error: "device_blocked" },
           { status: 409 },
         );
       }
       if (!boundFp) {
-        // First query on this device — bind it now.
         await bindEmailToDevice(exam.id, email, fingerprint);
       }
     }
 
-    // --- View-once enforcement ----------------------------------------------
-    // We check *before* returning the result so a second request never leaks
-    // the grade. The view is recorded only on a successful lookup so that a
-    // "not found" student does not burn a non-existent view.
+    // --- Step 3: View-once enforcement --------------------------------------
     const alreadyViewed = await hasViewedExam(exam.id, email);
     if (alreadyViewed && exam.viewOnceEnabled) {
+      console.log(`[POST /api/result ${requestId}] 409 already_viewed`);
       return NextResponse.json(
         { error: "already_viewed" },
         { status: 409 },
       );
     }
 
-    // --- Read the Excel file -------------------------------------------------
+    // --- Step 4: Read the Excel file from storage ---------------------------
     let fileBuffer: Buffer;
     try {
+      console.log(
+        `[POST /api/result ${requestId}] reading file "${exam.fileName}" from storage...`,
+      );
       fileBuffer = await examFileStorage.read(exam.fileName);
+      console.log(
+        `[POST /api/result ${requestId}] file read OK — size=${fileBuffer.length} bytes, firstBytes=${fileBuffer.slice(0, 8).toString("hex")}`,
+      );
     } catch (readError) {
-      // Log the ACTUAL error so it shows up in Vercel logs. Previously this
-      // was a silent `catch {}` which made download/parse failures look like
-      // a generic 404 — impossible to diagnose.
       console.error(
-        `[POST /api/result] storage.read failed for ` +
-          `"${exam.fileName}" (examId=${exam.id}, email=${email}):`,
+        `[POST /api/result ${requestId}] storage.read failed for "${exam.fileName}":`,
         readError,
       );
-      // Distinguish "file missing" from "file unreadable" so the UI can show
-      // a more specific message when the data file truly doesn't exist.
       const errMsg = (readError as Error).message ?? "";
       const isMissing =
         /BLOB_NOT_FOUND/i.test(errMsg) ||
         /ENOENT/.test(errMsg) ||
         /not.?found/i.test(errMsg);
       return NextResponse.json(
-        { error: isMissing ? "no_data_file" : "server_error" },
+        {
+          error: isMissing ? "no_data_file" : "server_error",
+          detail: `Storage read failed: ${errMsg}`,
+          fileName: exam.fileName,
+        },
         { status: isMissing ? 404 : 500 },
       );
     }
 
-    // --- Parse the Excel buffer ----------------------------------------------
+    // --- Step 5: Parse the Excel buffer -------------------------------------
     let parsed;
     try {
       parsed = parseExcelBuffer(fileBuffer);
+      console.log(
+        `[POST /api/result ${requestId}] parsed OK — ${parsed.count} student rows, headers=[${parsed.headers.join(", ")}]`,
+      );
     } catch (parseError) {
-      // xlsx.read can throw if the buffer is corrupt or not actually an
-      // xlsx. Log the buffer size + first bytes so the admin can see whether
-      // the file was truncated or the wrong format.
       console.error(
-        `[POST /api/result] xlsx parse failed for ` +
-          `"${exam.fileName}" (size=${fileBuffer.length}, ` +
-          `firstBytes=${fileBuffer.slice(0, 8).toString("hex")}):`,
+        `[POST /api/result ${requestId}] xlsx parse failed for "${exam.fileName}" (size=${fileBuffer.length}):`,
         parseError,
       );
       return NextResponse.json(
-        { error: "server_error" },
+        {
+          error: "server_error",
+          detail: `Excel parse failed: ${(parseError as Error).message}`,
+          fileName: exam.fileName,
+        },
         { status: 500 },
       );
     }
 
-    const student = findStudentByEmail(parsed, email);
-
-    if (!student) {
+    if (parsed.count === 0) {
+      console.error(
+        `[POST /api/result ${requestId}] 404 no_result — parsed.count=0 (file is empty or has no data rows)`,
+      );
       return NextResponse.json(
-        { error: "no_result" },
+        {
+          error: "no_result",
+          detail: "The Excel file contains no student data rows.",
+          fileName: exam.fileName,
+          rowsParsed: 0,
+        },
         { status: 404 },
       );
     }
 
-    // --- Compute grade + band ------------------------------------------------
+    // --- Step 6: Find the student by email ----------------------------------
+    const student = findStudentByEmail(parsed, email);
+    if (!student) {
+      // Log the first few emails in the file so the admin can verify the
+      // email actually exists (and the column detection picked the right one).
+      const sampleEmails = parsed.rows
+        .slice(0, 5)
+        .map((r) => r.email)
+        .filter(Boolean);
+      console.error(
+        `[POST /api/result ${requestId}] 404 no_result — email "${email}" not found in ${parsed.count} rows. Sample emails: [${sampleEmails.join(", ")}]`,
+      );
+      return NextResponse.json(
+        {
+          error: "no_result",
+          detail: `Email "${email}" was not found in the results file.`,
+          fileName: exam.fileName,
+          rowsParsed: parsed.count,
+          sampleEmails,
+        },
+        { status: 404 },
+      );
+    }
+    console.log(
+      `[POST /api/result ${requestId}] student found: name="${student.name}" grade="${student.grade}"`,
+    );
+
+    // --- Step 7: Compute grade + band ---------------------------------------
     const grade = parseGrade(student.grade, exam.maxScore);
     const customBands = parseGradeBands(exam.gradeBandsJson);
     const band = resolveGradeBand(grade.percent, customBands);
 
-    // --- Success group link gating -------------------------------------------
-    // The URL is base64-encoded before being sent to the client so that:
-    //   1. It is not readable in the raw network response body.
-    //   2. The client never renders an `href` attribute that could be copied
-    //      via long-press or inspected via DevTools.
-    // The client decodes it on-demand inside an onClick handler.
+    // --- Step 8: Success group link gating ----------------------------------
     let successGroupUrlB64: string | null = null;
     if (
       exam.successGroupUrl &&
       grade.percent !== null &&
       grade.percent >= exam.successThreshold
     ) {
-      // Buffer.toString("base64") is available in the Node runtime. Use
-      // unicode-safe encoding so non-ASCII URLs (rare but possible) survive.
       successGroupUrlB64 = Buffer.from(
         exam.successGroupUrl,
         "utf-8",
       ).toString("base64");
     }
 
-    // --- Record the view (only after a successful lookup) --------------------
+    // --- Step 9: Record the view (only after a successful lookup) -----------
     if (exam.viewOnceEnabled) {
       await recordExamView(exam.id, email, fingerprint);
     }
+
+    console.log(`[POST /api/result ${requestId}] 200 OK — percent=${grade.percent}`);
 
     return NextResponse.json({
       exam: {
@@ -206,9 +263,12 @@ export async function POST(request: Request) {
       issuedAt: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("[POST /api/result] error:", error);
+    console.error("[POST /api/result] uncaught error:", error);
     return NextResponse.json(
-      { error: "server_error" },
+      {
+        error: "server_error",
+        detail: (error as Error).message ?? "unknown",
+      },
       { status: 500 },
     );
   }

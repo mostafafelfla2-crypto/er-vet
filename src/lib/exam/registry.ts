@@ -122,9 +122,27 @@ export async function scanAndRegisterExams(): Promise<number> {
   return created;
 }
 
+/**
+ * Best-effort scan that never throws. If the storage backend is temporarily
+ * unreachable (e.g. Supabase rate limit, network blip), we log the error and
+ * continue — exams already in the DB remain queryable. This is critical
+ * because `getExam` and `listExams` both call this before touching the DB;
+ * a scanner failure must NOT block result lookups for existing exams.
+ */
+async function safeScanAndRegister(): Promise<void> {
+  try {
+    await scanAndRegisterExams();
+  } catch (err) {
+    console.error(
+      "[registry] scanAndRegisterExams failed (non-fatal, continuing with DB data):",
+      err,
+    );
+  }
+}
+
 /** List all exams, newest first. Runs a scan first so the UI stays in sync. */
 export async function listExams(): Promise<ExamSummary[]> {
-  await scanAndRegisterExams();
+  await safeScanAndRegister();
   const exams = await db.exam.findMany({
     orderBy: { createdAt: "desc" },
   });
@@ -135,7 +153,7 @@ export async function listExams(): Promise<ExamSummary[]> {
 export async function getExam(
   identifier: string,
 ): Promise<ExamSummary | null> {
-  await scanAndRegisterExams();
+  await safeScanAndRegister();
   const exam = await db.exam.findFirst({
     where: {
       OR: [{ id: identifier }, { slug: identifier }],

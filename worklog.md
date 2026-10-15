@@ -572,3 +572,84 @@ Stage Summary:
 - The Blob→Buffer conversion is now robust across all Node runtime variants
   (undici Blob, Web Blob, fetch Response body) with three fallback strategies
   and post-conversion validation (empty-body check + PK magic-byte check).
+
+---
+
+## Task ID: 14 — Diagnostic logging + non-fatal scanner + debug endpoint
+Agent: main (Z.ai Code)
+Task: `/api/result` keeps returning 404 in production on Vercel. The user can
+see the HTTP 404 in Vercel logs but not the underlying cause. Add diagnostics
+to pinpoint exactly which step fails.
+
+Work Log:
+
+### Fix 1 — Non-fatal scanner (`src/lib/exam/registry.ts`)
+- **Root cause**: `getExam()` and `listExams()` both called
+  `scanAndRegisterExams()` which calls `examFileStorage.list()` (Supabase).
+  If the Supabase `list()` call failed for ANY reason (rate limit, network
+  blip, misconfigured bucket), `getExam` threw, and the result route's outer
+  catch returned 500 — OR if the error was swallowed, the exam lookup
+  returned null → 404 `exam_not_found`. This blocked result lookups even for
+  exams that were already in the DB.
+- **Fix**: added a `safeScanAndRegister()` wrapper that catches and logs
+  scanner errors. `getExam` and `listExams` now call the safe version, so a
+  scanner failure never blocks DB lookups for existing exams.
+
+### Fix 2 — Step-by-step logging in `/api/result` (`src/app/api/result/route.ts`)
+- Rewrote the route with a `requestId` for correlating log lines, and a
+  `console.log`/`console.error` at every step:
+  1. Start (email + examId)
+  2. Exam found (id + fileName)
+  3. Reading file from storage
+  4. File read OK (size + firstBytes hex)
+  5. Parsed OK (row count + headers)
+  6. Student found (name + grade)
+  7. Final 200 OK (percent)
+- Every 404 response now includes a `detail` field with context:
+  - `exam_not_found`: includes the examId that was searched
+  - `exam_inactive`: includes the exam's display name
+  - `no_data_file`: includes the fileName + the storage error message
+  - `no_result`: includes `rowsParsed`, `fileName`, and `sampleEmails` (first
+    5 emails in the file) so the admin can verify the email actually exists
+    and the column detection picked the right column
+  - `server_error` (parse failure): includes the parse error message
+- The `no_result` case logs the first 5 emails in the file, which lets the
+  admin instantly see whether the email column was detected correctly.
+
+### Fix 3 — Debug endpoint (`src/app/api/debug/storage/route.ts`)
+- New admin-only `GET /api/debug/storage` endpoint that returns a full
+  diagnostic report:
+  - Active storage backend + env var status (SUPABASE_URL/KEY/DATABASE_URL set?)
+  - `list()` result (ok + files)
+  - For each exam in the DB: `fileExists`, `readResult` (ok/size/firstBytes/
+    error), `parseResult` (ok/rowCount/headers/sampleEmails/error)
+- Open `https://your-app.vercel.app/api/debug/storage` while logged in as
+  admin to see the full pipeline status at a glance.
+
+### Fix 4 — Supabase `exists()` method
+- The old implementation used `list(pathName, {limit:1})` — treating the
+  filename as a prefix/folder path. Supabase interprets this as "list files
+  INSIDE the folder named `results-xxx.xlsx`" which returns an empty array
+  for files. Fixed to use `list("", { search: pathName })` which searches
+  the bucket root for the exact filename.
+
+### Verification
+- Lint clean.
+- Local smoke test:
+  - Debug endpoint returns structured report showing all exams, their
+    read/parse status, row counts, and sample emails.
+  - Result API with valid email → 200 OK.
+  - Result API with nonexistent email → 404 `no_result` with
+    `detail`, `rowsParsed: 5`, `sampleEmails: [...]`.
+  - Dev log shows step-by-step trace with request IDs.
+
+Stage Summary:
+- The user can now diagnose the 404 by either:
+  1. Opening `/api/debug/storage` in the browser (admin-only) — shows the
+     full pipeline status, OR
+  2. Checking the Vercel function logs — every result request now logs
+     which step it reached and why it failed, OR
+  3. Checking the network tab — every 404 response includes a `detail`
+     field explaining the specific failure.
+- The scanner is now non-fatal: a Supabase `list()` failure no longer
+  blocks result lookups for exams already in the DB.
