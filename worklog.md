@@ -421,3 +421,81 @@ Stage Summary:
 - The success-group URL is invisible to DOM inspectors and cannot be copied
   via long-press. It is base64-encoded in the network response and decoded
   only inside the onClick handler at click time.
+
+---
+
+## Task ID: 12 — Migrate Storage from Vercel Blob to Supabase Storage
+Agent: main (Z.ai Code)
+Task: The Vercel Blob store was suspended after exceeding the Hobby plan's
+2000 advanced-operations limit. Refactor the storage layer to use Supabase
+Storage instead.
+
+Work Log:
+- **Dependencies**: removed `@vercel/blob`, installed `@supabase/supabase-js@2.118.0`.
+- **`src/lib/exam/storage.ts`** — full rewrite of the cloud backend:
+  - Deleted `VercelBlobExamFileStorage` (and its `streamToBuffer` helper, the
+    `@vercel/blob` dynamic imports, and the `BLOB_READ_WRITE_TOKEN` logic).
+  - Added `SupabaseExamFileStorage` implementing the same `ExamFileStorage`
+    interface so no other code (scanner, upload API, result API, delete API)
+    needed to change:
+    * **Auth**: uses `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` env vars.
+      The service-role key bypasses RLS — safe because this module only runs
+      server-side. The admin client is created with
+      `auth: { persistSession: false, autoRefreshToken: false }` so it never
+      tries to use browser localStorage.
+    * **Bucket**: `exams` (constant `SUPABASE_BUCKET`), expected to be created
+      as a *private* bucket in the Supabase dashboard.
+    * **save()**: `client.storage.from('exams').upload(path, buffer,
+      { contentType, upsert: true, cacheControl })`. `upsert: true` makes
+      re-uploads idempotent.
+    * **read()**: `.download(path)` returns `{ data: Blob, error }`. We call
+      `blob.arrayBuffer()` and convert to a Node `Buffer` for the xlsx parser.
+      404 / not-found errors are mapped to `BLOB_NOT_FOUND:` so the result API
+      can surface a friendly "file unavailable" message.
+    * **list()**: `.list('', { limit: 100, offset })` with pagination loop
+      (safety-capped at 100 pages) and `.xlsx` filtering.
+    * **delete()**: `.remove([path])` — idempotent (swallows not-found).
+    * **exists()**: `.list(path, { limit: 1 })` — Supabase has no `head`
+      method, so we list with the filename as prefix and check if it returns
+      itself.
+    * The Supabase client is created **lazily** via `getClient()` — this
+      prevents a crash at module-load time when credentials are temporarily
+      missing (e.g. a Vercel deployment before env vars are wired). The error
+      surfaces clearly at the first storage operation instead.
+  - **Singleton selection** (`createStorage`):
+    * `NODE_ENV=production` OR `VERCEL=1` → always `SupabaseExamFileStorage`
+      (no local fallback — prevents the EROFS crash on Vercel's read-only FS).
+    * `EXAM_STORAGE=local` is an explicit escape hatch that forces the
+      filesystem backend even in production (for self-hosted deployments with
+      a writable data volume).
+    * Local dev → filesystem by default; Supabase when creds are present or
+      `EXAM_STORAGE=supabase` is set.
+    * `isUsingSupabase` now derived from `examFileStorage instanceof
+      SupabaseExamFileStorage` (single source of truth, no drift).
+- **`.env`** updated with the Supabase variables (`SUPABASE_URL`,
+  `SUPABASE_SERVICE_ROLE_KEY`) and instructions to create the private `exams`
+  bucket in the Supabase dashboard.
+- Verified the selection matrix with 5 simulated-environment tests — all pass:
+  | Scenario | Backend |
+  |----------|---------|
+  | Production + creds | Supabase |
+  | Production, no creds (no crash) | Supabase (clear error on first op) |
+  | Local dev | Local FS |
+  | Local dev + creds | Supabase |
+  | EXAM_STORAGE=local override | Local FS |
+- Confirmed no `@vercel/blob`, `VercelBlobExamFileStorage`,
+  `BLOB_READ_WRITE_TOKEN`, or `isUsingVercelBlob` references remain in source.
+- Lint clean.
+
+Stage Summary:
+- Storage now uses Supabase Storage (private `exams` bucket) instead of the
+  suspended Vercel Blob store. The `ExamFileStorage` interface is unchanged,
+  so the scanner, upload API, result API, and delete API work without
+  modification.
+- Deploy checklist for the user:
+  1. Create a **private** bucket named `exams` in the Supabase dashboard
+     (Storage → New bucket → name: `exams` → Public: OFF).
+  2. In Vercel project settings → Environment Variables, add:
+     - `SUPABASE_URL` = your Supabase project URL
+     - `SUPABASE_SERVICE_ROLE_KEY` = the service_role key (NOT the anon key)
+  3. Redeploy. Uploads/reads will flow through Supabase Storage.

@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 /**
  * Storage abstraction for uploaded Excel files.
@@ -7,14 +8,15 @@ import path from "node:path";
  * Two implementations are shipped:
  *
  *   1. `LocalExamFileStorage` — persists files to `public/uploads/excel` on the
- *      local filesystem. Used in development and any environment that does not
- *      provide a `BLOB_READ_WRITE_TOKEN`.
+ *      local filesystem. Used in local development where no Supabase
+ *      credentials are configured.
  *
- *   2. `VercelBlobExamFileStorage` — stores files in a (private) Vercel Blob
- *      store. Selected automatically when `BLOB_READ_WRITE_TOKEN` is present,
- *      which is the case after the Vercel project is connected to Blob Storage.
- *      This is the only Vercel-compatible option because Vercel's production
- *      filesystem is read-only at runtime.
+ *   2. `SupabaseExamFileStorage` — stores files in a *private* Supabase
+ *      Storage bucket named `exams`. Authenticated via the service-role key so
+ *      the operations bypass RLS (this module only ever runs server-side).
+ *      Selected automatically when `SUPABASE_URL` and
+ *      `SUPABASE_SERVICE_ROLE_KEY` are present, and is the required backend on
+ *      Vercel because Vercel's production filesystem is read-only at runtime.
  *
  * The rest of the application (scanner, upload API, result API) talks to the
  * `ExamFileStorage` interface exclusively, so switching between the two
@@ -35,8 +37,15 @@ export interface ExamFileStorage {
 
 const UPLOAD_DIR = path.join(process.cwd(), "public/uploads/excel");
 
+/** Supabase bucket name — must exist and be private in the Supabase dashboard. */
+const SUPABASE_BUCKET = "exams";
+
+/** MIME type for .xlsx files. */
+const XLSX_CONTENT_TYPE =
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
 // ---------------------------------------------------------------------------
-// Local filesystem implementation (development / preview without Blob token)
+// Local filesystem implementation (development without Supabase credentials)
 // ---------------------------------------------------------------------------
 
 export class LocalExamFileStorage implements ExamFileStorage {
@@ -87,153 +96,190 @@ export class LocalExamFileStorage implements ExamFileStorage {
 }
 
 // ---------------------------------------------------------------------------
-// Vercel Blob implementation (production)
+// Supabase Storage implementation (production)
 // ---------------------------------------------------------------------------
 
 /**
- * Vercel Blob-backed storage for a *private* Blob store.
+ * Supabase Storage-backed storage for a *private* bucket.
  *
- * Auth: the `BLOB_READ_WRITE_TOKEN` environment variable (auto-injected by
- * Vercel once the project is linked to a Blob store). All SDK calls accept an
- * explicit `token` option which we pass defensively, though the SDK also reads
- * the env var directly.
+ * Auth: `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` environment variables.
+ * The service-role key bypasses Row-Level-Security — this is safe because the
+ * module only runs on the server (API routes), never in the browser.
  *
- * File naming: every blob is stored with its canonical `results-{ExamName}-
+ * Bucket: `exams` — must be created in the Supabase dashboard and set to
+ * "private" so files are not publicly accessible. All reads go through the
+ * authenticated admin client (`download`), not public URLs.
+ *
+ * File naming: every file is stored with its canonical `results-{ExamName}-
  * {SECRET_CODE}.xlsx` pathname (no random suffix), so the scanner can match it
- * against the secret pattern and the DB row stays 1:1 with the blob pathname.
- *
- * Reading private blobs: the SDK's `get(pathname, { access: 'private' })`
- * returns a `ReadableStream` with the blob content — no signed URL juggling
- * needed. We drain the stream into a Buffer.
+ * against the secret pattern and the DB row stays 1:1 with the object key.
  */
-export class VercelBlobExamFileStorage implements ExamFileStorage {
-  private readonly token: string | undefined;
+export class SupabaseExamFileStorage implements ExamFileStorage {
+  private client: SupabaseClient | null = null;
+  private readonly url: string;
+  private readonly serviceKey: string;
 
   constructor() {
-    this.token = process.env.BLOB_READ_WRITE_TOKEN;
-    if (!this.token && process.env.NODE_ENV === "production") {
-      // Surface the misconfiguration loudly — uploads/reads would otherwise
-      // fail with cryptic 401s deep inside the SDK.
-      console.warn(
-        "[VercelBlobExamFileStorage] BLOB_READ_WRITE_TOKEN is not set. " +
-          "Vercel Blob operations will fail until the store is connected.",
+    this.url = (process.env.SUPABASE_URL ?? "").trim();
+    this.serviceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? "").trim();
+
+    if (!this.url || !this.serviceKey) {
+      if (process.env.NODE_ENV === "production" || process.env.VERCEL) {
+        console.error(
+          "[SupabaseExamFileStorage] SUPABASE_URL or " +
+            "SUPABASE_SERVICE_ROLE_KEY is not set. Supabase Storage operations " +
+            "will fail until the credentials are configured.",
+        );
+      }
+    }
+  }
+
+  /**
+   * Lazily create the admin client on first use. This avoids crashing at
+   * module-load time when credentials are temporarily missing (e.g. a Vercel
+   * deployment before the env vars are wired up) — instead the error surfaces
+   * at the first storage operation with a clear message.
+   */
+  private getClient(): SupabaseClient {
+    if (this.client) return this.client;
+    if (!this.url || !this.serviceKey) {
+      throw new Error(
+        "[SupabaseExamFileStorage] SUPABASE_URL or " +
+          "SUPABASE_SERVICE_ROLE_KEY is not configured. Set both in your " +
+          "environment variables (Supabase dashboard → Project Settings → API).",
       );
     }
+    // `auth: { persistSession: false }` is important — we are running on the
+    // server and must not try to persist sessions to localStorage (which does
+    // not exist in Node).
+    this.client = createClient(this.url, this.serviceKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+    return this.client;
   }
 
   async save(fileName: string, data: ArrayBuffer | Buffer): Promise<void> {
-    const { put } = await import("@vercel/blob");
-    // `addRandomSuffix: false` keeps the canonical name so the scanner and the
-    // DB row can reference the exact pathname. `allowOverwrite: true` makes
-    // re-uploading an exam idempotent.
-    await put(fileName, data, {
-      access: "private",
-      addRandomSuffix: false,
-      allowOverwrite: true,
-      contentType:
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      token: this.token,
-    });
+    const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    // `upsert: true` makes re-uploading an exam idempotent (same path
+    // overwrites the existing object instead of erroring).
+    const { error } = await this.getClient()
+      .storage.from(SUPABASE_BUCKET)
+      .upload(this.sanitize(fileName), body, {
+        contentType: XLSX_CONTENT_TYPE,
+        upsert: true,
+        cacheControl: "3600",
+      });
+    if (error) {
+      throw new Error(
+        `SUPABASE_UPLOAD_FAILED:${fileName} — ${error.message}`,
+      );
+    }
   }
 
   async read(fileName: string): Promise<Buffer> {
-    const { get, head } = await import("@vercel/blob");
+    const pathName = this.sanitize(fileName);
+    // `download` returns a thenable builder that resolves to
+    // { data: Blob, error } | { data: null, error }.
+    const { data, error } = await this.getClient()
+      .storage.from(SUPABASE_BUCKET)
+      .download(pathName);
 
-    // `get` returns the content stream for private blobs when `access` is set.
-    const result = await get(fileName, {
-      access: "private",
-      token: this.token,
-    });
-
-    if (!result || result.statusCode !== 200 || !result.stream) {
-      // Distinguish "missing" from "unreadable" for clearer errors upstream.
-      const exists = await this.exists(fileName);
-      if (!exists) {
+    if (error || !data) {
+      // Distinguish "not found" from other errors for clearer upstream
+      // handling (the result API maps BLOB_NOT_FOUND to a friendly message).
+      const code = (error as { statusCode?: number } | null)?.statusCode;
+      if (code === 404 || /not.?found/i.test(error?.message ?? "")) {
         throw new Error(`BLOB_NOT_FOUND:${fileName}`);
       }
       throw new Error(
-        `BLOB_READ_FAILED:${fileName} (status=${result?.statusCode ?? "n/a"})`,
+        `SUPABASE_READ_FAILED:${fileName} — ${error?.message ?? "unknown"}`,
       );
     }
 
-    return streamToBuffer(result.stream);
+    // The Blob's `.arrayBuffer()` is available in Node 18+ (undici). Convert
+    // to a Node Buffer for the xlsx parser.
+    const arrayBuffer = await (data as Blob).arrayBuffer();
+    return Buffer.from(arrayBuffer);
   }
 
   async list(): Promise<string[]> {
-    const { list } = await import("@vercel/blob");
+    // `list(prefix, options)` — we pass an empty prefix to list the bucket
+    // root. Supabase paginates in pages of 100 by default; loop until
+    // exhausted so the scanner sees every exam.
     const collected: string[] = [];
-    let cursor: string | undefined;
-    // The list() API is paginated; loop until exhausted so the scanner sees
-    // every exam even when the store grows past the default page size.
-    do {
-      const result = await list({
-        token: this.token,
-        ...(cursor ? { cursor } : {}),
-      });
-      for (const blob of result.blobs) {
-        // `blob.pathname` is the base name (no leading slash) for blobs stored
-        // at the root of the store.
-        if (/\.xlsx$/i.test(blob.pathname)) {
-          collected.push(blob.pathname);
+    let offset = 0;
+    const limit = 100;
+    // Guard against infinite loops if the API misbehaves.
+    let safety = 0;
+    while (safety++ < 100) {
+      const { data, error } = await this.getClient()
+        .storage.from(SUPABASE_BUCKET)
+        .list("", { limit, offset, sortBy: { column: "name", order: "asc" } });
+      if (error) {
+        throw new Error(
+          `SUPABASE_LIST_FAILED — ${error.message}`,
+        );
+      }
+      if (!data || data.length === 0) break;
+      for (const file of data) {
+        // Folder entries have null metadata; skip anything that isn't an
+        // .xlsx file. `file.name` is the object key relative to the prefix.
+        if (file.name && /\.xlsx$/i.test(file.name)) {
+          collected.push(file.name);
         }
       }
-      cursor = result.hasMore ? result.cursor : undefined;
-    } while (cursor);
-
+      if (data.length < limit) break; // last page
+      offset += limit;
+    }
     return collected.sort();
   }
 
   async delete(fileName: string): Promise<void> {
-    const { del } = await import("@vercel/blob");
-    try {
-      await del(fileName, { token: this.token });
-    } catch (err) {
-      // `del` is idempotent — a missing blob is not an error worth surfacing.
-      const message = (err as Error).message ?? "";
-      if (!/not_found|not found|404/i.test(message)) {
-        throw err;
+    const { error } = await this.getClient()
+      .storage.from(SUPABASE_BUCKET)
+      .remove([this.sanitize(fileName)]);
+    if (error) {
+      const message = error.message ?? "";
+      // `remove` is idempotent — a missing object is not an error worth
+      // surfacing.
+      if (!/not.?found|404/i.test(message)) {
+        throw new Error(`SUPABASE_DELETE_FAILED:${fileName} — ${message}`);
       }
     }
   }
 
   async exists(fileName: string): Promise<boolean> {
-    const { head } = await import("@vercel/blob");
-    try {
-      const blob = await head(fileName, { token: this.token });
-      return blob !== null;
-    } catch {
-      return false;
-    }
+    // Supabase has no dedicated `head`/`exists` method. The cheapest way to
+    // check existence is `list` with a prefix filter — a single object name
+    // as the prefix returns at most one entry.
+    const pathName = this.sanitize(fileName);
+    const { data, error } = await this.getClient()
+      .storage.from(SUPABASE_BUCKET)
+      .list(pathName, { limit: 1 });
+    if (error) return false;
+    // When listing with a full filename as the prefix, Supabase returns the
+    // file itself (if it exists) or an empty array.
+    return Array.isArray(data) && data.some((f) => f.name === pathName);
   }
-}
 
-/** Drain a Web ReadableStream<Uint8Array> into a Node Buffer. */
-async function streamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Buffer> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalLength = 0;
-  // Read loop: pull chunks until done, accumulating byte lengths so we can
-  // allocate a single Buffer at the end (cheaper than repeated concat).
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) {
-      chunks.push(value);
-      totalLength += value.byteLength;
-    }
+  /** Guard against path traversal — only the base name is used. */
+  private sanitize(fileName: string): string {
+    return path.basename(fileName);
   }
-  const out = Buffer.alloc(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
 // Singleton selection
 // ---------------------------------------------------------------------------
+
+function hasSupabaseCredentials(): boolean {
+  return Boolean(
+    process.env.SUPABASE_URL &&
+      process.env.SUPABASE_URL.trim().length > 0 &&
+      process.env.SUPABASE_SERVICE_ROLE_KEY &&
+      process.env.SUPABASE_SERVICE_ROLE_KEY.trim().length > 0,
+  );
+}
 
 /**
  * Select the storage backend.
@@ -243,49 +289,45 @@ async function streamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Buffe
  * — it crashes with `EROFS: read-only file system`. Therefore:
  *
  *   - When `NODE_ENV=production` OR the `VERCEL` env var is set, we ALWAYS
- *     return the Vercel Blob backend. We do NOT fall back to local even if the
- *     `BLOB_READ_WRITE_TOKEN` is missing — instead the Blob SDK itself will
- *     raise a clear "Access denied" error, which is far easier to diagnose than
- *     the EROFS crash that a silent local fallback would produce.
+ *     return the Supabase backend. We do NOT fall back to local even if the
+ *     Supabase credentials are missing — instead the Supabase client itself
+ *     will raise a clear auth error, which is far easier to diagnose than the
+ *     EROFS crash that a silent local fallback would produce.
  *
  *   - In local development (no `VERCEL`, `NODE_ENV !== "production"`) we use
- *     the filesystem by default for convenience, and switch to Blob when a
- *     token is present or `EXAM_STORAGE=blob` is set (useful for testing
- *     against the real store).
+ *     the filesystem by default for convenience, and switch to Supabase when
+ *     credentials are present or `EXAM_STORAGE=supabase` is set (useful for
+ *     testing against the real bucket).
  *
  * Detection signals:
- *   - `process.env.BLOB_READ_WRITE_TOKEN` — auto-injected by Vercel once a
- *     Blob store is linked to the project. We treat empty string as "not set".
+ *   - `process.env.SUPABASE_URL` + `process.env.SUPABASE_SERVICE_ROLE_KEY`
  *   - `process.env.VERCEL` — set to `"1"` by Vercel for every deployment.
  *   - `process.env.NODE_ENV` — `"production"` on Vercel prod.
  */
 function createStorage(): ExamFileStorage {
   const isProduction = process.env.NODE_ENV === "production";
   const isVercel = Boolean(process.env.VERCEL);
-  const hasBlobToken = Boolean(
-    process.env.BLOB_READ_WRITE_TOKEN &&
-      process.env.BLOB_READ_WRITE_TOKEN.trim().length > 0,
-  );
+  const hasSupabase = hasSupabaseCredentials();
+  // Explicit escape hatch: `EXAM_STORAGE=local` forces the filesystem backend
+  // even in production (useful for self-hosted deployments with a writable
+  // data volume). Everything else on Vercel MUST use Supabase because the
+  // serverless filesystem is read-only.
+  const forceLocal = process.env.EXAM_STORAGE === "local";
 
-  // --- Production / Vercel: Blob is MANDATORY (no local fallback) ----------
-  if (isProduction || isVercel) {
-    if (!hasBlobToken) {
-      // Fail loud and clear. We still return the Blob backend so that the
-      // error surfaced is a descriptive Blob SDK auth error rather than the
-      // confusing EROFS from a read-only filesystem write.
+  if (!forceLocal && (isProduction || isVercel)) {
+    if (!hasSupabase) {
       console.error(
         "[storage] Production/Vercel environment detected but " +
-          "BLOB_READ_WRITE_TOKEN is not set. Connect a Vercel Blob store to " +
-          "the project. Refusing to fall back to the read-only local " +
-          "filesystem.",
+          "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set. " +
+          "Refusing to fall back to the read-only local filesystem.",
       );
     }
-    return new VercelBlobExamFileStorage();
+    return new SupabaseExamFileStorage();
   }
 
-  // --- Local development ---------------------------------------------------
-  if (process.env.EXAM_STORAGE === "blob" || hasBlobToken) {
-    return new VercelBlobExamFileStorage();
+  // --- Local development (or explicit local override) ----------------------
+  if (!forceLocal && (process.env.EXAM_STORAGE === "supabase" || hasSupabase)) {
+    return new SupabaseExamFileStorage();
   }
   return new LocalExamFileStorage();
 }
@@ -293,13 +335,5 @@ function createStorage(): ExamFileStorage {
 /** Singleton storage instance used across the application. */
 export const examFileStorage: ExamFileStorage = createStorage();
 
-/** Whether the active storage backend is Vercel Blob. Exposed for diagnostics. */
-export const isUsingVercelBlob =
-  process.env.NODE_ENV === "production" ||
-  Boolean(process.env.VERCEL) ||
-  (process.env.EXAM_STORAGE === "blob"
-    ? true
-    : Boolean(
-        process.env.BLOB_READ_WRITE_TOKEN &&
-          process.env.BLOB_READ_WRITE_TOKEN.trim().length > 0,
-      ) && process.env.EXAM_STORAGE !== "local");
+/** Whether the active storage backend is Supabase Storage. Exposed for diagnostics. */
+export const isUsingSupabase = examFileStorage instanceof SupabaseExamFileStorage;
