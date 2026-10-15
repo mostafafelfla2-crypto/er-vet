@@ -7,14 +7,41 @@ import { Loader2, Lock, Mail, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useI18n } from "@/i18n/i18n-provider";
 import { SiteHeader } from "@/components/student/site-header";
 import { SiteFooter } from "@/components/student/site-footer";
 
-/** Admin login screen. Posts credentials to /api/admin/login. */
-export function AdminLogin() {
+interface AdminLoginProps {
+  /** Fired when the server confirms a successful login. Lets the parent flip
+   * its authed state instantly so the dashboard renders without a manual
+   * page refresh. */
+  onAuthenticated?: () => void;
+}
+
+/**
+ * Admin login screen. Posts credentials to /api/admin/login.
+ *
+ * On success we do TWO things in order:
+ *   1. Call `onAuthenticated()` — the parent (`AdminPortal`) flips its
+ *      `authed` state to `true` synchronously, so the dashboard mounts
+ *      immediately with zero flash of the login form.
+ *   2. `await router.refresh()` — this re-runs the server component
+ *      (`/admin-hidden-portal/page.tsx`) so its `getAdminSession()` call
+ *      re-evaluates against the freshly-set cookie, and the
+ *      `initialAuthed` prop stays in sync. We await it so the refresh
+ *      finishes before we replace the URL (otherwise the router cache can
+ *      serve a stale render). Finally `router.replace` updates the URL
+ *      without leaving a history entry.
+ */
+export function AdminLogin({ onAuthenticated }: AdminLoginProps) {
   const { t } = useI18n();
   const router = useRouter();
   const [email, setEmail] = useState("");
@@ -37,8 +64,14 @@ export function AdminLogin() {
         setError(t("admin.loginError"));
         return;
       }
-      // Force a fresh load so server-rendered state is reconciled.
-      router.refresh();
+
+      // 1. Instant client-side state flip — no waiting for a server round-trip.
+      onAuthenticated?.();
+
+      // 2. Reconcile server state: await the refresh so the server component
+      //    re-evaluates the session cookie, then replace the URL. Awaiting
+      //    prevents the router cache from serving a stale (unauthed) render.
+      await router.refresh();
       router.replace("/admin-hidden-portal");
     } catch {
       setError(t("admin.loginError"));
@@ -64,7 +97,9 @@ export function AdminLogin() {
                   <ShieldCheck className="size-5" />
                 </div>
                 <div>
-                  <CardTitle className="text-lg">{t("admin.loginTitle")}</CardTitle>
+                  <CardTitle className="text-lg">
+                    {t("admin.loginTitle")}
+                  </CardTitle>
                   <CardDescription className="text-xs">
                     {t("admin.subtitle")}
                   </CardDescription>
@@ -93,7 +128,10 @@ export function AdminLogin() {
                   </div>
                 </div>
                 <div className="space-y-1.5">
-                  <Label htmlFor="admin-password" className="text-sm font-medium">
+                  <Label
+                    htmlFor="admin-password"
+                    className="text-sm font-medium"
+                  >
                     {t("admin.passwordLabel")}
                   </Label>
                   <div className="relative">
@@ -114,7 +152,9 @@ export function AdminLogin() {
 
                 {error && (
                   <Alert variant="destructive" className="rounded-xl">
-                    <AlertDescription className="text-xs">{error}</AlertDescription>
+                    <AlertDescription className="text-xs">
+                      {error}
+                    </AlertDescription>
                   </Alert>
                 )}
 

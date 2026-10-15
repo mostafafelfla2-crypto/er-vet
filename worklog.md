@@ -339,3 +339,85 @@ Stage Summary:
   should be deleted via the admin panel (or the DB reset) so the scanner
   re-registers them against the renamed blobs. New uploads will use the new
   format automatically.
+
+---
+
+## Task ID: 11 — Admin Login Glitch + Secure Join Group Button
+Agent: main (Z.ai Code)
+Task: Fix (1) admin portal requiring manual page refresh after login, and
+(2) secure the "Join Group" button against long-press copy and DevTools
+inspection of the raw WhatsApp/Telegram URL.
+
+Work Log:
+
+### Fix 1 — Admin login instant state update
+- **Root cause**: `AdminLogin` called `router.refresh()` without awaiting it,
+  then immediately called `router.replace()`. Because `router.refresh()` is
+  async (it re-runs the server component and updates the Router Cache), the
+  navigation fired before the refresh completed — so the server component's
+  `getAdminSession()` re-evaluated against a stale render and the
+  `initialAuthed` prop stayed `false`. The user saw the login form until they
+  manually refreshed.
+- **Fix** in `src/components/admin/admin-login.tsx`:
+  - Added an `onAuthenticated?: () => void` prop.
+  - On successful login: call `onAuthenticated()` FIRST (synchronous client
+    state flip), THEN `await router.refresh()` (so the server component
+    re-evaluates the session cookie and the Router Cache is invalidated),
+    THEN `router.replace("/admin-hidden-portal")`.
+- **Fix** in `src/components/admin/admin-portal.tsx`:
+  - Added `handleAuthenticated` callback that does `setAuthed(true)`.
+  - Passed it to `<AdminLogin onAuthenticated={handleAuthenticated} />`.
+  - When the callback fires, `authed` flips to `true` synchronously and the
+    component returns `<AdminDashboard />` immediately — no flash of the login
+    form, no manual refresh needed.
+
+### Fix 2 — Secure "Join Group" button (anti-copy & anti-inspect)
+- **Root cause**: the success-group link was rendered as an `<a href="...">`
+  tag. The raw WhatsApp/Telegram URL was therefore (a) visible in the DOM to
+  anyone opening DevTools, (b) copyable via long-press on mobile, and
+  (c) sent in plaintext in the `/api/result` JSON response.
+- **Fix** — three layers of obfuscation:
+
+  1. **Server-side encoding** (`src/app/api/result/route.ts`):
+     - Renamed the response field from `successGroupUrl` to
+       `successGroupUrlB64`.
+     - The URL is now base64-encoded via `Buffer.from(url, "utf-8")
+       .toString("base64")` before being sent. The raw URL never appears in
+       the network response body.
+
+  2. **Client-side type** (`src/components/student/result-card.tsx`):
+     - `ResultPayload.successGroupUrl` → `successGroupUrlB64: string | null`.
+
+  3. **DOM rendering** (`result-card.tsx`):
+     - Replaced `<a href={...}>` with `<Button type="button" onClick={...}>`.
+       There is NO `href` attribute anywhere in the DOM — the URL cannot be
+       copied via long-press and cannot be seen by inspecting the element.
+     - Added anti-copy CSS classes to the button:
+       `select-none` (disable text selection),
+       `[-webkit-touch-callout:none]` (disable iOS long-press context menu),
+       `[-webkit-tap-highlight-color:transparent]` (clean tap),
+       `[touch-action:manipulation]` (prevent double-tap zoom delay).
+     - The `onClick` handler calls `openSuccessGroup(b64)` which:
+       - decodes the base64 string via `atob(b64)`,
+       - validates it starts with `http(s)://` (defensive — never opens
+         `javascript:` or `data:` URLs),
+       - opens it via `window.open(decoded, "_blank", "noopener,noreferrer")`.
+       The decoded URL is a local variable that is never persisted or written
+       to the DOM.
+
+### Verification
+- Lint clean.
+- Direct API test: `POST /api/result` returns `successGroupUrlB64`
+  (`aHR0cHM6Ly9jaGF0...`) and the raw `successGroupUrl` key is **absent**
+  from the response. The base64 decodes correctly to the WhatsApp URL.
+- Code inspection confirms: no `href` attribute in the result-card DOM, the
+  button uses `onClick` + `window.open`, and anti-copy classes are applied.
+- The admin login code path uses `onAuthenticated` (instant client flip) +
+  `await router.refresh()` (server cache invalidation) before
+  `router.replace()` — the standard App Router fix for this glitch.
+
+Stage Summary:
+- Admin login now updates the UI instantly — no manual refresh required.
+- The success-group URL is invisible to DOM inspectors and cannot be copied
+  via long-press. It is base64-encoded in the network response and decoded
+  only inside the onClick handler at click time.

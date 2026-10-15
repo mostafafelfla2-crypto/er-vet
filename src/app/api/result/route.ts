@@ -120,13 +120,23 @@ export async function POST(request: Request) {
     const band = resolveGradeBand(grade.percent, customBands);
 
     // --- Success group link gating -------------------------------------------
-    let successGroupUrl: string | null = null;
+    // The URL is base64-encoded before being sent to the client so that:
+    //   1. It is not readable in the raw network response body.
+    //   2. The client never renders an `href` attribute that could be copied
+    //      via long-press or inspected via DevTools.
+    // The client decodes it on-demand inside an onClick handler.
+    let successGroupUrlB64: string | null = null;
     if (
       exam.successGroupUrl &&
       grade.percent !== null &&
       grade.percent >= exam.successThreshold
     ) {
-      successGroupUrl = exam.successGroupUrl;
+      // Buffer.toString("base64") is available in the Node runtime. Use
+      // unicode-safe encoding so non-ASCII URLs (rare but possible) survive.
+      successGroupUrlB64 = Buffer.from(
+        exam.successGroupUrl,
+        "utf-8",
+      ).toString("base64");
     }
 
     // --- Record the view (only after a successful lookup) --------------------
@@ -157,7 +167,7 @@ export async function POST(request: Request) {
             max: band.max,
           }
         : null,
-      successGroupUrl,
+      successGroupUrlB64,
       viewOnceEnabled: exam.viewOnceEnabled,
       issuedAt: new Date().toISOString(),
     });
