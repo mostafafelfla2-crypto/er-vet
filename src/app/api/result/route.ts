@@ -97,14 +97,48 @@ export async function POST(request: Request) {
     let fileBuffer: Buffer;
     try {
       fileBuffer = await examFileStorage.read(exam.fileName);
-    } catch {
+    } catch (readError) {
+      // Log the ACTUAL error so it shows up in Vercel logs. Previously this
+      // was a silent `catch {}` which made download/parse failures look like
+      // a generic 404 — impossible to diagnose.
+      console.error(
+        `[POST /api/result] storage.read failed for ` +
+          `"${exam.fileName}" (examId=${exam.id}, email=${email}):`,
+        readError,
+      );
+      // Distinguish "file missing" from "file unreadable" so the UI can show
+      // a more specific message when the data file truly doesn't exist.
+      const errMsg = (readError as Error).message ?? "";
+      const isMissing =
+        /BLOB_NOT_FOUND/i.test(errMsg) ||
+        /ENOENT/.test(errMsg) ||
+        /not.?found/i.test(errMsg);
       return NextResponse.json(
-        { error: "no_data_file" },
-        { status: 404 },
+        { error: isMissing ? "no_data_file" : "server_error" },
+        { status: isMissing ? 404 : 500 },
       );
     }
 
-    const parsed = parseExcelBuffer(fileBuffer);
+    // --- Parse the Excel buffer ----------------------------------------------
+    let parsed;
+    try {
+      parsed = parseExcelBuffer(fileBuffer);
+    } catch (parseError) {
+      // xlsx.read can throw if the buffer is corrupt or not actually an
+      // xlsx. Log the buffer size + first bytes so the admin can see whether
+      // the file was truncated or the wrong format.
+      console.error(
+        `[POST /api/result] xlsx parse failed for ` +
+          `"${exam.fileName}" (size=${fileBuffer.length}, ` +
+          `firstBytes=${fileBuffer.slice(0, 8).toString("hex")}):`,
+        parseError,
+      );
+      return NextResponse.json(
+        { error: "server_error" },
+        { status: 500 },
+      );
+    }
+
     const student = findStudentByEmail(parsed, email);
 
     if (!student) {

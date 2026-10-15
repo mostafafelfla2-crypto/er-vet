@@ -499,3 +499,76 @@ Stage Summary:
      - `SUPABASE_URL` = your Supabase project URL
      - `SUPABASE_SERVICE_ROLE_KEY` = the service_role key (NOT the anon key)
   3. Redeploy. Uploads/reads will flow through Supabase Storage.
+
+---
+
+## Task ID: 13 — Fix Supabase file read + add error logging to result API
+Agent: main (Z.ai Code)
+Task: Files upload to Supabase successfully and the email exists in the Excel
+sheet, but `/api/result` returns 404. The `SupabaseExamFileStorage.read()` was
+failing to properly convert the downloaded Blob to a Buffer, and the API route
+silently swallowed the error (`catch {}`), making it look like a generic 404.
+
+Work Log:
+
+### Fix 1 — `src/lib/exam/storage.ts` `SupabaseExamFileStorage.read()`
+- **Root cause**: the old `read()` did `await (data as Blob).arrayBuffer()` in
+  a single line with no fallback. In the Vercel serverless runtime the Blob
+  returned by Supabase's `download()` can be an undici Blob whose
+  `arrayBuffer()` behaves differently, or the conversion can fail silently —
+  producing an empty/invalid buffer that xlsx can't parse.
+- **Fix**: rewrote `read()` with three defensive layers:
+  1. **Download error handling**: `.download(path).catch(...)` now catches
+     network-level errors too (not just `{ error }` responses). All errors
+     are logged via `console.error` with the filename so they appear in Vercel
+     logs. 404/not-found errors are mapped to `BLOB_NOT_FOUND:` for upstream.
+  2. **Multi-strategy Blob→Buffer conversion** (tries each in order, logs
+     which one fails):
+     - Strategy 1: `Blob.arrayBuffer()` → `Buffer.from(ab)` (modern undici)
+     - Strategy 2: `Blob.stream()` → drain via `streamToBuffer()` helper
+     - Strategy 3: `Blob.text()` → `Buffer.from(text, "utf-8")` (last resort)
+  3. **Post-conversion validation**:
+     - Empty body → throws `SUPABASE_EMPTY_BODY:` with the Blob's type/size
+       logged (catches the "silent crash" where download succeeds but the
+       body is unreadable).
+     - **PK zip magic-byte check**: xlsx files start with `0x50 0x4B` (PK).
+       If the first two bytes don't match, throws `SUPABASE_INVALID_XLSX:`
+       with the first 4 bytes as hex — so the admin sees corruption instead
+       of a cryptic 404.
+- Re-added the `streamToBuffer()` helper function (it was removed with the
+  Vercel Blob code but is needed for Strategy 2).
+
+### Fix 2 — `src/app/api/result/route.ts` error logging
+- **Root cause**: the inner `try/catch` around `examFileStorage.read()` was a
+  silent `catch {}` — any download/parse failure was swallowed and returned
+  as a generic `404 no_data_file` with zero log output. Impossible to diagnose
+  on Vercel.
+- **Fix**: split into two separate try/catch blocks with full logging:
+  1. **Storage read** (`storage.read`): `catch (readError)` now logs
+     `[POST /api/result] storage.read failed for "{fileName}" (examId=..., email=...):`
+     plus the full error object. It then distinguishes "file missing"
+     (BLOB_NOT_FOUND / ENOENT / not-found → 404 `no_data_file`) from
+     "file unreadable" (→ 500 `server_error`).
+  2. **Excel parse** (`parseExcelBuffer`): a new dedicated `catch (parseError)`
+     logs `[POST /api/result] xlsx parse failed for "{fileName}" (size=..., firstBytes=...hex):`
+     so the admin can see whether the file was truncated or the wrong format.
+     Returns 500 `server_error`.
+- The outer catch (line 208) already had `console.error` — unchanged.
+
+### Verification
+- Lint clean.
+- Local smoke test (sqlite + local storage): result API returns the correct
+  student (أحمد محمد علي, 9/10, 90%) with the base64-encoded success URL.
+- Error-path test: created an exam pointing to a non-existent file, searched
+  it → the dev log now shows the full error:
+  `[POST /api/result] storage.read failed for "results-Nonexistent-MSF2msf3.xlsx" (examId=..., email=...): Error: ENOENT: no such file or directory, open '...'`
+  and the response correctly returns `404 no_data_file` (ENOENT matches the
+  isMissing pattern). Previously this would have been a silent 404.
+
+Stage Summary:
+- The "silent crash → 404" is fixed. Storage read errors and xlsx parse errors
+  are now logged with full context (filename, examId, email, buffer size,
+  first bytes) so they show up in Vercel logs.
+- The Blob→Buffer conversion is now robust across all Node runtime variants
+  (undici Blob, Web Blob, fetch Response body) with three fallback strategies
+  and post-conversion validation (empty-body check + PK magic-byte check).

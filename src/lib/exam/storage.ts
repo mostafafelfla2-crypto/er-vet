@@ -180,26 +180,120 @@ export class SupabaseExamFileStorage implements ExamFileStorage {
     const pathName = this.sanitize(fileName);
     // `download` returns a thenable builder that resolves to
     // { data: Blob, error } | { data: null, error }.
-    const { data, error } = await this.getClient()
+    const downloadResult = await this.getClient()
       .storage.from(SUPABASE_BUCKET)
-      .download(pathName);
+      .download(pathName)
+      .catch((err: unknown) => ({
+        data: null,
+        error: err as Error,
+      }));
+
+    const data = downloadResult.data;
+    const error = downloadResult.error as
+      | { message?: string; statusCode?: number }
+      | null;
 
     if (error || !data) {
       // Distinguish "not found" from other errors for clearer upstream
       // handling (the result API maps BLOB_NOT_FOUND to a friendly message).
-      const code = (error as { statusCode?: number } | null)?.statusCode;
-      if (code === 404 || /not.?found/i.test(error?.message ?? "")) {
+      const code = error?.statusCode;
+      const msg = error?.message ?? "";
+      if (code === 404 || /not.?found/i.test(msg)) {
         throw new Error(`BLOB_NOT_FOUND:${fileName}`);
       }
+      // Log the full error so it shows up in Vercel logs — a bare re-throw
+      // would hide the cause behind a generic 404 upstream.
+      console.error(
+        `[SupabaseExamFileStorage.read] download failed for "${fileName}":`,
+        error ?? "no data",
+      );
       throw new Error(
-        `SUPABASE_READ_FAILED:${fileName} — ${error?.message ?? "unknown"}`,
+        `SUPABASE_READ_FAILED:${fileName} — ${msg || "unknown error"}`,
       );
     }
 
-    // The Blob's `.arrayBuffer()` is available in Node 18+ (undici). Convert
-    // to a Node Buffer for the xlsx parser.
-    const arrayBuffer = await (data as Blob).arrayBuffer();
-    return Buffer.from(arrayBuffer);
+    // The Supabase JS SDK returns a `Blob` from `download()`. In the
+    // Node/serverless runtime this is an undici Blob — it exposes
+    // `.arrayBuffer()`, `.text()`, and `.stream()`. We convert to a Node
+    // `Buffer` for the xlsx parser.
+    //
+    // We try several conversion strategies in order, because the exact
+    // runtime shape of the returned Blob can vary (undici Blob vs. Web Blob
+    // vs. a fetch Response body). Each branch validates the result is a
+    // non-empty Buffer before returning.
+    let buffer: Buffer | null = null;
+
+    // Strategy 1: Blob.arrayBuffer() (modern undici / Web Blobs).
+    if (!buffer && typeof (data as Blob).arrayBuffer === "function") {
+      try {
+        const ab = await (data as Blob).arrayBuffer();
+        if (ab && ab.byteLength > 0) {
+          buffer = Buffer.from(ab);
+        }
+      } catch (err) {
+        console.error(
+          `[SupabaseExamFileStorage.read] arrayBuffer() failed for "${fileName}":`,
+          err,
+        );
+      }
+    }
+
+    // Strategy 2: Blob.stream() → drain into a Buffer (Node streams).
+    if (!buffer && typeof (data as Blob).stream === "function") {
+      try {
+        const stream = (data as Blob).stream() as ReadableStream<Uint8Array>;
+        buffer = await streamToBuffer(stream);
+      } catch (err) {
+        console.error(
+          `[SupabaseExamFileStorage.read] stream() failed for "${fileName}":`,
+          err,
+        );
+      }
+    }
+
+    // Strategy 3: Blob.text() then encode (last-resort, works for any Blob).
+    if (!buffer && typeof (data as Blob).text === "function") {
+      try {
+        const text = await (data as Blob).text();
+        if (text && text.length > 0) {
+          buffer = Buffer.from(text, "utf-8");
+        }
+      } catch (err) {
+        console.error(
+          `[SupabaseExamFileStorage.read] text() failed for "${fileName}":`,
+          err,
+        );
+      }
+    }
+
+    if (!buffer || buffer.length === 0) {
+      // This is the "silent crash" case: the download reported success but
+      // the body was empty or unreadable. Log loudly so it shows in Vercel.
+      console.error(
+        `[SupabaseExamFileStorage.read] downloaded "${fileName}" but the ` +
+          `body is empty or could not be converted to a Buffer. ` +
+          `Blob type=${(data as Blob).type}, size=${(data as Blob).size}`,
+      );
+      throw new Error(
+        `SUPABASE_EMPTY_BODY:${fileName} — download succeeded but body is empty/unreadable`,
+      );
+    }
+
+    // Sanity check: xlsx files start with the PK zip magic bytes (0x50 0x4B).
+    // If the first bytes don't match, the file is not a valid xlsx — log it
+    // so the admin can see the corruption instead of getting a cryptic 404.
+    if (buffer[0] !== 0x50 || buffer[1] !== 0x4b) {
+      console.error(
+        `[SupabaseExamFileStorage.read] "${fileName}" does not start with ` +
+          `the PK zip magic bytes — it is not a valid .xlsx file. ` +
+          `First bytes: ${buffer.slice(0, 4).toString("hex")}`,
+      );
+      throw new Error(
+        `SUPABASE_INVALID_XLSX:${fileName} — file is not a valid xlsx archive`,
+      );
+    }
+
+    return buffer;
   }
 
   async list(): Promise<string[]> {
@@ -266,6 +360,31 @@ export class SupabaseExamFileStorage implements ExamFileStorage {
   private sanitize(fileName: string): string {
     return path.basename(fileName);
   }
+}
+
+/**
+ * Drain a Web ReadableStream<Uint8Array> into a Node Buffer.
+ * Used as a fallback when Blob.arrayBuffer() is unavailable or fails.
+ */
+async function streamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Buffer> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalLength = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      totalLength += value.byteLength;
+    }
+  }
+  const out = Buffer.alloc(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
