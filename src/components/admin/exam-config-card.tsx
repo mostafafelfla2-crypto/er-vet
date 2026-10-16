@@ -103,6 +103,10 @@ export function ExamConfigCard({ exam, onDelete, onSaved }: ExamConfigCardProps)
   const [resetViews, setResetViews] = useState(true);
   const [resetBindings, setResetBindings] = useState(true);
 
+  // --- Replace file state --------------------------------------------------
+  const [replacingFile, setReplacingFile] = useState(false);
+  const [replaceFileName, setReplaceFileName] = useState<string | null>(null);
+
   // Re-sync local state when the exam prop changes after a refetch.
   useEffect(() => {
     setDisplayNameAr(exam.displayNameAr);
@@ -409,6 +413,59 @@ export function ExamConfigCard({ exam, onDelete, onSaved }: ExamConfigCardProps)
     }
   }
 
+  // --- Replace file (upload a new .xlsx for an existing exam) ---------------
+  async function handleReplaceFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setReplacingFile(true);
+    setReplaceFileName(file.name);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch(`/api/admin/exams/${exam.id}/file`, {
+        method: "POST",
+        body: formData,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (res.status === 401 || data.error === "unauthorized") {
+          toast.error(
+            locale === "ar"
+              ? "انتهت الجلسة — سجّل دخول مرة أخرى"
+              : "Session expired — please log in again",
+          );
+          if (typeof window !== "undefined") window.location.reload();
+          return;
+        }
+        toast.error(
+          data.detail
+            ? `${data.error}: ${data.detail}`
+            : locale === "ar"
+              ? `فشل الاستبدال (${res.status}): ${data.error ?? "خطأ"}`
+              : `Replace failed (${res.status}): ${data.error ?? "error"}`,
+        );
+        return;
+      }
+      toast.success(
+        locale === "ar"
+          ? `تم استبدال الملف بنجاح (${data.exam.studentCount} طالب)`
+          : `File replaced successfully (${data.exam.studentCount} students)`,
+      );
+      onSaved();
+    } catch (err) {
+      toast.error(
+        locale === "ar"
+          ? `فشل الاستبدال: ${(err as Error).message ?? "خطأ"}`
+          : `Replace failed: ${(err as Error).message ?? "error"}`,
+      );
+    } finally {
+      setReplacingFile(false);
+      setReplaceFileName(null);
+      // Reset the input so the same file can be selected again.
+      if (e.target) e.target.value = "";
+    }
+  }
+
   const createdLabel = new Intl.DateTimeFormat(
     locale === "ar" ? "ar-EG" : "en-GB",
     { dateStyle: "medium", timeStyle: "short" },
@@ -543,6 +600,74 @@ export function ExamConfigCard({ exam, onDelete, onSaved }: ExamConfigCardProps)
                     title={t("admin.active")}
                     desc={locale === "ar" ? "إظهار الامتحان في البوابة" : "Show exam in the portal"}
                   />
+                </AccordionContent>
+              </AccordionItem>
+
+              {/* Replace file — upload a new .xlsx for this exam */}
+              <AccordionItem value="replace-file" className="border-border/60">
+                <AccordionTrigger className="text-sm font-semibold hover:no-underline">
+                  <span className="flex items-center gap-2">
+                    <Upload className="size-4 text-primary" />
+                    {locale === "ar" ? "استبدال ملف النتائج" : "Replace Results File"}
+                  </span>
+                </AccordionTrigger>
+                <AccordionContent className="space-y-3 pt-2">
+                  <div className="rounded-lg border border-border/60 bg-muted/40 p-3">
+                    <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                      {locale === "ar" ? "الملف الحالي" : "Current file"}
+                    </p>
+                    <p className="mt-1 break-all text-xs font-mono" dir="ltr">
+                      {exam.fileName}
+                    </p>
+                  </div>
+
+                  <p className="text-xs text-muted-foreground">
+                    {locale === "ar"
+                      ? "ارفع ملف Excel جديد لاستبدال النتائج الحالية. سيتم الحفاظ على جميع الإعدادات (التقديرات، رابط المجموعة، التتبع) كما هي."
+                      : "Upload a new Excel file to replace the current results. All settings (grade bands, group link, tracking) are preserved."}
+                  </p>
+
+                  {/* Hidden file input + trigger button */}
+                  <input
+                    id={`replace-file-${exam.id}`}
+                    type="file"
+                    accept=".xlsx,.xls"
+                    className="sr-only"
+                    onChange={handleReplaceFile}
+                    disabled={replacingFile}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={replacingFile}
+                    onClick={() => {
+                      const input = document.getElementById(
+                        `replace-file-${exam.id}`,
+                      ) as HTMLInputElement | null;
+                      input?.click();
+                    }}
+                    className="gap-1.5"
+                  >
+                    {replacingFile ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <Upload className="size-3.5" />
+                    )}
+                    {replacingFile
+                      ? locale === "ar"
+                        ? "جارٍ الاستبدال..."
+                        : "Replacing..."
+                      : locale === "ar"
+                        ? "اختر ملف جديد"
+                        : "Choose new file"}
+                  </Button>
+
+                  {replacingFile && replaceFileName && (
+                    <p className="text-[11px] text-muted-foreground" dir="ltr">
+                      {replaceFileName}
+                    </p>
+                  )}
                 </AccordionContent>
               </AccordionItem>
 
