@@ -5,14 +5,17 @@ import { motion } from "framer-motion";
 import {
   CheckCircle2,
   ChevronDown,
+  Download,
   Eye,
   Fingerprint,
   Link2,
   Loader2,
   Palette,
+  RotateCcw,
   Save,
   Settings2,
   Trash2,
+  Upload,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -86,6 +89,15 @@ export function ExamConfigCard({ exam, onDelete, onSaved }: ExamConfigCardProps)
   const [isActive, setIsActive] = useState(exam.isActive);
   const [saving, setSaving] = useState(false);
   const [open, setOpen] = useState(false);
+
+  // --- Tracking management state --------------------------------------------
+  const [trackingResetting, setTrackingResetting] = useState(false);
+  const [trackingExporting, setTrackingExporting] = useState(false);
+  const [trackingImporting, setTrackingImporting] = useState(false);
+  const [trackingCounts, setTrackingCounts] = useState<{
+    views: number;
+    bindings: number;
+  } | null>(null);
 
   // Re-sync local state when the exam prop changes after a refetch.
   useEffect(() => {
@@ -164,6 +176,199 @@ export function ExamConfigCard({ exam, onDelete, onSaved }: ExamConfigCardProps)
       toast.error(t("admin.saveError"));
     } finally {
       setSaving(false);
+    }
+  }
+
+  // --- Tracking: fetch counts (called when the section is opened/hovered) --
+  // Always force a fresh fetch so counts stay accurate after reset/import.
+  // The endpoint is cheap (two COUNT queries) and we pass cache: "no-store".
+  async function fetchTrackingCounts(force = false) {
+    if (!force && trackingCounts) return; // already loaded (non-forced)
+    try {
+      const res = await fetch(`/api/admin/exams/${exam.id}/tracking`, {
+        cache: "no-store",
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      setTrackingCounts({
+        views: data.stats?.totalViews ?? 0,
+        bindings: data.stats?.totalBindings ?? 0,
+      });
+    } catch {
+      // non-fatal — the section just shows "—" instead of counts
+    }
+  }
+
+  // --- Tracking: reset (clear all views + bindings) -----------------------
+  async function handleTrackingReset() {
+    setTrackingResetting(true);
+    try {
+      const res = await fetch(`/api/admin/exams/${exam.id}/tracking`, {
+        method: "DELETE",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // Show the ACTUAL error so the admin knows why it failed (401
+        // session expired, 500 server error, etc.) instead of a generic
+        // message.
+        if (res.status === 401 || data.error === "unauthorized") {
+          toast.error(
+            locale === "ar"
+              ? "انتهت الجلسة — سجّل دخول مرة أخرى"
+              : "Session expired — please log in again",
+          );
+          // Force a reload to the login screen.
+          if (typeof window !== "undefined") window.location.reload();
+          return;
+        }
+        toast.error(
+          data.detail
+            ? `${data.error}: ${data.detail}`
+            : locale === "ar"
+              ? `فشل المسح (${res.status}): ${data.error ?? "خطأ غير معروف"}`
+              : `Reset failed (${res.status}): ${data.error ?? "unknown"}`,
+        );
+        return;
+      }
+      toast.success(
+        locale === "ar"
+          ? `تم مسح ${data.deleted.views} مشاهدة و ${data.deleted.bindings} ربط`
+          : `Cleared ${data.deleted.views} views and ${data.deleted.bindings} bindings`,
+      );
+      // Immediately update the displayed counts + force a refresh on next hover.
+      setTrackingCounts({ views: 0, bindings: 0 });
+      onSaved();
+    } catch (err) {
+      toast.error(
+        locale === "ar"
+          ? `فشل الاتصال: ${(err as Error).message ?? "خطأ"}`
+          : `Connection failed: ${(err as Error).message ?? "error"}`,
+      );
+    } finally {
+      setTrackingResetting(false);
+    }
+  }
+
+  // --- Tracking: export (download JSON) ------------------------------------
+  async function handleTrackingExport() {
+    setTrackingExporting(true);
+    try {
+      const res = await fetch(`/api/admin/exams/${exam.id}/tracking`, {
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 401 || data.error === "unauthorized") {
+          toast.error(
+            locale === "ar"
+              ? "انتهت الجلسة — سجّل دخول مرة أخرى"
+              : "Session expired — please log in again",
+          );
+          if (typeof window !== "undefined") window.location.reload();
+          return;
+        }
+        toast.error(
+          locale === "ar"
+            ? `فشل التصدير (${res.status}): ${data.error ?? "خطأ"}`
+            : `Export failed (${res.status}): ${data.error ?? "error"}`,
+        );
+        return;
+      }
+      const data = await res.json();
+      const json = JSON.stringify(data, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const safeSlug = exam.slug.replace(/[^a-z0-9-]/gi, "-");
+      a.download = `tracking-${safeSlug}-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      // Update the counts from the export payload (it includes stats).
+      if (data.stats) {
+        setTrackingCounts({
+          views: data.stats.totalViews ?? 0,
+          bindings: data.stats.totalBindings ?? 0,
+        });
+      }
+      toast.success(
+        locale === "ar" ? "تم تصدير بيانات التتبع" : "Tracking data exported",
+      );
+    } catch (err) {
+      toast.error(
+        locale === "ar"
+          ? `فشل التصدير: ${(err as Error).message ?? "خطأ"}`
+          : `Export failed: ${(err as Error).message ?? "error"}`,
+      );
+    } finally {
+      setTrackingExporting(false);
+    }
+  }
+
+  // --- Tracking: import (upload JSON) --------------------------------------
+  async function handleTrackingImport(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setTrackingImporting(true);
+    try {
+      const text = await file.text();
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        toast.error(
+          locale === "ar"
+            ? "ملف JSON غير صالح"
+            : "Invalid JSON file",
+        );
+        return;
+      }
+      const res = await fetch(`/api/admin/exams/${exam.id}/tracking`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(parsed),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (res.status === 401 || data.error === "unauthorized") {
+          toast.error(
+            locale === "ar"
+              ? "انتهت الجلسة — سجّل دخول مرة أخرى"
+              : "Session expired — please log in again",
+          );
+          if (typeof window !== "undefined") window.location.reload();
+          return;
+        }
+        toast.error(
+          data.detail
+            ? `${data.error}: ${data.detail}`
+            : locale === "ar"
+              ? `فشل الاستيراد (${res.status}): ${data.error ?? "خطأ"}`
+              : `Import failed (${res.status}): ${data.error ?? "error"}`,
+        );
+        return;
+      }
+      toast.success(
+        locale === "ar"
+          ? `تم استيراد ${data.imported.views.total} مشاهدة و ${data.imported.bindings.total} ربط`
+          : `Imported ${data.imported.views.total} views and ${data.imported.bindings.total} bindings`,
+      );
+      // Force a fresh fetch of counts so the UI reflects the new totals.
+      setTrackingCounts(null);
+      await fetchTrackingCounts(true);
+      onSaved();
+    } catch (err) {
+      toast.error(
+        locale === "ar"
+          ? `فشل الاستيراد: ${(err as Error).message ?? "خطأ"}`
+          : `Import failed: ${(err as Error).message ?? "error"}`,
+      );
+    } finally {
+      setTrackingImporting(false);
+      // Reset the input so the same file can be selected again.
+      if (e.target) e.target.value = "";
     }
   }
 
@@ -480,6 +685,146 @@ export function ExamConfigCard({ exam, onDelete, onSaved }: ExamConfigCardProps)
                     title={t("admin.deviceBindingLabel")}
                     desc={t("admin.deviceBindingDesc")}
                   />
+                </AccordionContent>
+              </AccordionItem>
+
+              {/* Tracking management — reset / export / import */}
+              <AccordionItem
+                value="tracking"
+                className="border-border/60"
+                onMouseEnter={() => fetchTrackingCounts()}
+              >
+                <AccordionTrigger
+                  className="text-sm font-semibold hover:no-underline"
+                  onClick={() => fetchTrackingCounts(true)}
+                >
+                  <span className="flex items-center gap-2">
+                    <RotateCcw className="size-4 text-primary" />
+                    {locale === "ar" ? "إدارة التتبع" : "Tracking Management"}
+                    {trackingCounts && (trackingCounts.views > 0 || trackingCounts.bindings > 0) && (
+                      <Badge variant="secondary" className="ml-1 gap-1 text-[10px]">
+                        {trackingCounts.views + trackingCounts.bindings}
+                      </Badge>
+                    )}
+                  </span>
+                </AccordionTrigger>
+                <AccordionContent className="space-y-3 pt-2">
+                  {/* Counts summary */}
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="rounded-lg border border-border/60 bg-muted/40 p-3 text-center">
+                      <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                        {locale === "ar" ? "المشاهدات" : "Views"}
+                      </p>
+                      <p className="mt-1 text-lg font-bold">
+                        {trackingCounts?.views ?? "—"}
+                      </p>
+                    </div>
+                    <div className="rounded-lg border border-border/60 bg-muted/40 p-3 text-center">
+                      <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                        {locale === "ar" ? "ربط الأجهزة" : "Bindings"}
+                      </p>
+                      <p className="mt-1 text-lg font-bold">
+                        {trackingCounts?.bindings ?? "—"}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Action buttons */}
+                  <div className="flex flex-wrap gap-2 pt-1">
+                    {/* Reset */}
+                    <AlertDialog>
+                      <AlertDialogTrigger asChild>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={trackingResetting}
+                          className="gap-1.5 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                        >
+                          {trackingResetting ? (
+                            <Loader2 className="size-3.5 animate-spin" />
+                          ) : (
+                            <RotateCcw className="size-3.5" />
+                          )}
+                          {locale === "ar" ? "إعادة تعيين" : "Reset"}
+                        </Button>
+                      </AlertDialogTrigger>
+                      <AlertDialogContent>
+                        <AlertDialogHeader>
+                          <AlertDialogTitle>
+                            {locale === "ar"
+                              ? "إعادة تعيين التتبع"
+                              : "Reset Tracking"}
+                          </AlertDialogTitle>
+                          <AlertDialogDescription>
+                            {locale === "ar"
+                              ? "سيتم حذف جميع سجلات المشاهدات وربط الأجهزة لهذا الامتحان. سيتتمكن جميع الطلاب من مشاهدة نتائجهم مرة أخرى من أي جهاز. لا يمكن التراجع عن هذا الإجراء."
+                              : "This will delete ALL view logs and device bindings for this exam. All students will be able to view their results again from any device. This cannot be undone."}
+                          </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <AlertDialogFooter>
+                          <AlertDialogCancel>
+                            {t("common.cancel")}
+                          </AlertDialogCancel>
+                          <AlertDialogAction
+                            onClick={handleTrackingReset}
+                            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                          >
+                            {t("common.confirm")}
+                          </AlertDialogAction>
+                        </AlertDialogFooter>
+                      </AlertDialogContent>
+                    </AlertDialog>
+
+                    {/* Export */}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleTrackingExport}
+                      disabled={trackingExporting}
+                      className="gap-1.5"
+                    >
+                      {trackingExporting ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <Download className="size-3.5" />
+                      )}
+                      {locale === "ar" ? "تصدير" : "Export"}
+                    </Button>
+
+                    {/* Import */}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={trackingImporting}
+                      onClick={() => {
+                        const input = document.getElementById(
+                          `tracking-import-${exam.id}`,
+                        ) as HTMLInputElement | null;
+                        input?.click();
+                      }}
+                      className="gap-1.5"
+                    >
+                      {trackingImporting ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <Upload className="size-3.5" />
+                      )}
+                      {locale === "ar" ? "استيراد" : "Import"}
+                    </Button>
+                    <input
+                      id={`tracking-import-${exam.id}`}
+                      type="file"
+                      accept="application/json,.json"
+                      className="sr-only"
+                      onChange={handleTrackingImport}
+                    />
+                  </div>
+
+                  <p className="text-[11px] text-muted-foreground">
+                    {locale === "ar"
+                      ? "تصدير يحفظ بيانات التتبع كملف JSON. استيراد يستعيد البيانات من ملف JSON. إعادة تعيين يمسح كل البيانات."
+                      : "Export saves tracking data as a JSON file. Import restores data from a JSON file. Reset clears all data."}
+                  </p>
                 </AccordionContent>
               </AccordionItem>
             </Accordion>
