@@ -294,7 +294,7 @@ export async function POST(
 // ---------------------------------------------------------------------------
 
 export async function DELETE(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
@@ -309,19 +309,44 @@ export async function DELETE(
       );
     }
 
-    // Delete all view logs and device bindings for this exam. Both models
-    // have ON DELETE CASCADE on the exam relation, so deleting the exam would
-    // also clear them — but we only want to clear the tracking, not the exam.
-    const [deletedViews, deletedBindings] = await Promise.all([
-      db.viewLog.deleteMany({ where: { examId: exam.id } }),
-      db.deviceBinding.deleteMany({ where: { examId: exam.id } }),
-    ]);
+    // Parse optional query params: ?views=true&bindings=false
+    // When a param is absent we default to true (clear everything) so the
+    // endpoint stays backward-compatible with callers that don't send params.
+    const url = new URL(request.url);
+    const clearViews = url.searchParams.get("views") !== "false";
+    const clearBindings = url.searchParams.get("bindings") !== "false";
+
+    if (!clearViews && !clearBindings) {
+      return NextResponse.json(
+        {
+          error: "nothing_selected",
+          detail: "At least one of views/bindings must be true.",
+        },
+        { status: 400 },
+      );
+    }
+
+    // Only delete the selected categories. We run them in parallel for speed.
+    const deletions: Promise<{ count: number }>[] = [];
+    if (clearViews) {
+      deletions.push(
+        db.viewLog.deleteMany({ where: { examId: exam.id } }),
+      );
+    }
+    if (clearBindings) {
+      deletions.push(
+        db.deviceBinding.deleteMany({ where: { examId: exam.id } }),
+      );
+    }
+    const results = await Promise.all(deletions);
 
     return NextResponse.json({
       ok: true,
       deleted: {
-        views: deletedViews.count,
-        bindings: deletedBindings.count,
+        views: clearViews ? results[0]?.count ?? 0 : 0,
+        bindings: clearBindings
+          ? results[clearViews ? 1 : 0]?.count ?? 0
+          : 0,
       },
     });
   } catch (error) {
