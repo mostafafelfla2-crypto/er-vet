@@ -21,6 +21,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
 import {
   Card,
@@ -98,6 +99,9 @@ export function ExamConfigCard({ exam, onDelete, onSaved }: ExamConfigCardProps)
     views: number;
     bindings: number;
   } | null>(null);
+  // Reset dialog checkboxes — which categories to clear.
+  const [resetViews, setResetViews] = useState(true);
+  const [resetBindings, setResetBindings] = useState(true);
 
   // Re-sync local state when the exam prop changes after a refetch.
   useEffect(() => {
@@ -201,11 +205,25 @@ export function ExamConfigCard({ exam, onDelete, onSaved }: ExamConfigCardProps)
 
   // --- Tracking: reset (clear all views + bindings) -----------------------
   async function handleTrackingReset() {
+    // Safety: if neither category is selected, do nothing.
+    if (!resetViews && !resetBindings) {
+      toast.error(
+        locale === "ar"
+          ? "اختر على الأقل فئة واحدة للمسح"
+          : "Select at least one category to clear",
+      );
+      return;
+    }
     setTrackingResetting(true);
     try {
-      const res = await fetch(`/api/admin/exams/${exam.id}/tracking`, {
-        method: "DELETE",
-      });
+      // Build query string so the server only deletes the selected categories.
+      const params = new URLSearchParams();
+      params.set("views", resetViews ? "true" : "false");
+      params.set("bindings", resetBindings ? "true" : "false");
+      const res = await fetch(
+        `/api/admin/exams/${exam.id}/tracking?${params.toString()}`,
+        { method: "DELETE" },
+      );
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         // Show the ACTUAL error so the admin knows why it failed (401
@@ -230,13 +248,32 @@ export function ExamConfigCard({ exam, onDelete, onSaved }: ExamConfigCardProps)
         );
         return;
       }
+      // Build a descriptive toast based on what was actually cleared.
+      const parts: string[] = [];
+      if (resetViews) {
+        parts.push(
+          locale === "ar"
+            ? `${data.deleted.views} مشاهدة`
+            : `${data.deleted.views} views`,
+        );
+      }
+      if (resetBindings) {
+        parts.push(
+          locale === "ar"
+            ? `${data.deleted.bindings} ربط`
+            : `${data.deleted.bindings} bindings`,
+        );
+      }
       toast.success(
         locale === "ar"
-          ? `تم مسح ${data.deleted.views} مشاهدة و ${data.deleted.bindings} ربط`
-          : `Cleared ${data.deleted.views} views and ${data.deleted.bindings} bindings`,
+          ? `تم مسح ${parts.join(" و ")}`
+          : `Cleared ${parts.join(" and ")}`,
       );
-      // Immediately update the displayed counts + force a refresh on next hover.
-      setTrackingCounts({ views: 0, bindings: 0 });
+      // Update the displayed counts — only zero out the cleared categories.
+      setTrackingCounts((prev) => ({
+        views: resetViews ? 0 : prev?.views ?? 0,
+        bindings: resetBindings ? 0 : prev?.bindings ?? 0,
+      }));
       onSaved();
     } catch (err) {
       toast.error(
@@ -757,17 +794,74 @@ export function ExamConfigCard({ exam, onDelete, onSaved }: ExamConfigCardProps)
                           </AlertDialogTitle>
                           <AlertDialogDescription>
                             {locale === "ar"
-                              ? "سيتم حذف جميع سجلات المشاهدات وربط الأجهزة لهذا الامتحان. سيتتمكن جميع الطلاب من مشاهدة نتائجهم مرة أخرى من أي جهاز. لا يمكن التراجع عن هذا الإجراء."
-                              : "This will delete ALL view logs and device bindings for this exam. All students will be able to view their results again from any device. This cannot be undone."}
+                              ? "اختر ما تريد مسحه. لا يمكن التراجع عن هذا الإجراء."
+                              : "Select what to clear. This cannot be undone."}
                           </AlertDialogDescription>
                         </AlertDialogHeader>
+
+                        {/* Category checkboxes */}
+                        <div className="space-y-3 py-2">
+                          <label
+                            className="flex cursor-pointer items-start gap-3 rounded-lg border border-border/60 p-3 transition-colors hover:bg-muted/40"
+                            htmlFor={`reset-views-${exam.id}`}
+                          >
+                            <Checkbox
+                              id={`reset-views-${exam.id}`}
+                              checked={resetViews}
+                              onCheckedChange={(v) =>
+                                setResetViews(v === true)
+                              }
+                              className="mt-0.5"
+                            />
+                            <div className="min-w-0">
+                              <span className="block text-sm font-medium">
+                                {locale === "ar"
+                                  ? "سجلات المشاهدات (View Once)"
+                                  : "View logs (View Once)"}
+                              </span>
+                              <span className="block text-xs text-muted-foreground">
+                                {locale === "ar"
+                                  ? "مسحها يسمح للطلاب بمشاهدة نتائجهم مرة أخرى"
+                                  : "Clearing lets students view their results again"}
+                              </span>
+                            </div>
+                          </label>
+
+                          <label
+                            className="flex cursor-pointer items-start gap-3 rounded-lg border border-border/60 p-3 transition-colors hover:bg-muted/40"
+                            htmlFor={`reset-bindings-${exam.id}`}
+                          >
+                            <Checkbox
+                              id={`reset-bindings-${exam.id}`}
+                              checked={resetBindings}
+                              onCheckedChange={(v) =>
+                                setResetBindings(v === true)
+                              }
+                              className="mt-0.5"
+                            />
+                            <div className="min-w-0">
+                              <span className="block text-sm font-medium">
+                                {locale === "ar"
+                                  ? "ربط الأجهزة (Anti-sharing)"
+                                  : "Device bindings (Anti-sharing)"}
+                              </span>
+                              <span className="block text-xs text-muted-foreground">
+                                {locale === "ar"
+                                  ? "مسحها يسمح بالبحث من أي جهاز جديد"
+                                  : "Clearing allows searching from any new device"}
+                              </span>
+                            </div>
+                          </label>
+                        </div>
+
                         <AlertDialogFooter>
                           <AlertDialogCancel>
                             {t("common.cancel")}
                           </AlertDialogCancel>
                           <AlertDialogAction
                             onClick={handleTrackingReset}
-                            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                            disabled={!resetViews && !resetBindings}
+                            className="bg-destructive text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
                           >
                             {t("common.confirm")}
                           </AlertDialogAction>
