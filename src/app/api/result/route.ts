@@ -215,18 +215,14 @@ export async function POST(request: Request) {
     const customBands = parseGradeBands(exam.gradeBandsJson);
     const band = resolveGradeBand(grade.percent, customBands);
 
-    // --- Step 8: Success group link gating ----------------------------------
-    let successGroupUrlB64: string | null = null;
-    if (
-      exam.successGroupUrl &&
+    // --- Step 8: Success group eligibility ----------------------------------
+    // The group URL itself is NEVER sent to the client. The client only
+    // learns whether this student is eligible; the actual redirect is served
+    // by GET /api/join-group after it re-validates the request server-side.
+    const successGroupEligible =
+      Boolean(exam.successGroupUrl) &&
       grade.percent !== null &&
-      grade.percent >= exam.successThreshold
-    ) {
-      successGroupUrlB64 = Buffer.from(
-        exam.successGroupUrl,
-        "utf-8",
-      ).toString("base64");
-    }
+      grade.percent >= exam.successThreshold;
 
     // --- Step 9: Record the view (only after a successful lookup) -----------
     if (exam.viewOnceEnabled) {
@@ -258,7 +254,7 @@ export async function POST(request: Request) {
             max: band.max,
           }
         : null,
-      successGroupUrlB64,
+      successGroupEligible,
       viewOnceEnabled: exam.viewOnceEnabled,
       issuedAt: new Date().toISOString(),
     });

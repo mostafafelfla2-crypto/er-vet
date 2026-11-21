@@ -41,13 +41,13 @@ export interface ResultPayload {
     max: number;
   } | null;
   /**
-   * Base64-encoded success-group URL. The raw URL is intentionally NOT sent
-   * to the client — the server encodes it (Buffer.toString("base64")) so it
-   * is opaque in the network response and never rendered as an `href` in the
-   * DOM. The onClick handler decodes it on-demand and opens it via
-   * window.open. This prevents long-press copying and DevTools inspection.
+   * Whether this student may join the success group. The group URL itself is
+   * never sent to the browser: the button calls GET /api/join-group, which
+   * re-validates email + device + score server-side and then issues a 302
+   * redirect to the URL. The URL therefore never appears in page data, React
+   * props, or the DOM.
    */
-  successGroupUrlB64: string | null;
+  successGroupEligible: boolean;
   viewOnceEnabled: boolean;
   issuedAt: string;
 }
@@ -57,28 +57,19 @@ interface ResultCardProps {
 }
 
 /**
- * Decode a base64 success-group URL and open it in a new tab.
+ * Open the server-side join-group gateway in a new tab.
  *
- * The decode happens only at click time — the URL is never stored in a
- * variable that persists, never written to the DOM, and never appears as an
- * `href` attribute. `window.open` with `noopener,noreferrer` is used for
- * security (prevents the opened page from accessing `window.opener`).
+ * The endpoint re-validates the student (device binding + score threshold)
+ * and then 302-redirects to the success-group URL. The URL is never present
+ * in client-side code or page data, so it cannot be extracted with DevTools.
  */
-function openSuccessGroup(b64: string | null): void {
-  if (!b64 || typeof window === "undefined") return;
-  try {
-    // atob is available in all modern browsers. Decode then URI-decode to
-    // support any URL-encoded characters the admin may have entered.
-    const decoded = atob(b64);
-    if (!/^https?:\/\//i.test(decoded)) {
-      // Defensive: only open http(s) URLs, never javascript: or data:.
-      console.warn("[success-group] decoded value is not a URL, ignoring.");
-      return;
-    }
-    window.open(decoded, "_blank", "noopener,noreferrer");
-  } catch (err) {
-    console.error("[success-group] failed to decode URL", err);
-  }
+function openSuccessGroup(result: ResultPayload): void {
+  if (typeof window === "undefined") return;
+  const params = new URLSearchParams({
+    email: result.student.email,
+    examId: result.exam.id,
+  });
+  window.open(`/api/join-group?${params.toString()}`, "_blank", "noopener,noreferrer");
 }
 
 /** Animated result card shown after a successful student lookup. */
@@ -243,8 +234,8 @@ export function ResultCard({ result }: ResultCardProps) {
             )}
           </div>
 
-          {/* Success group link — anti-copy / anti-inspect */}
-          {result.successGroupUrlB64 && (
+          {/* Success group link — URL stays server-side */}
+          {result.successGroupEligible && (
             <motion.div
               initial={{ opacity: 0, scale: 0.97 }}
               animate={{ opacity: 1, scale: 1 }}
@@ -264,24 +255,21 @@ export function ResultCard({ result }: ResultCardProps) {
                   </p>
                   {/*
                     IMPORTANT: this is a <button>, NOT an <a>. There is no
-                    `href` attribute anywhere in the DOM — the URL cannot be
-                    copied via long-press and cannot be seen by inspecting the
-                    element. The URL is decoded from its base64 form only
-                    inside the onClick handler and opened via window.open.
+                    `href` attribute anywhere in the DOM and no URL anywhere
+                    in client-side code or page data. The button calls
+                    /api/join-group, which re-validates the request on the
+                    server and only then redirects to the group URL.
 
                     The CSS classes:
-                      select-none              — disable text selection
-                      [-webkit-touch-callout:none] — disable iOS long-press
+                      select-none              - disable text selection
+                      [-webkit-touch-callout:none] - disable iOS long-press
                                                      context menu / callout
-                      [-webkit-tap-highlight-color:transparent] — clean tap
-                      touch-callout-none      — alias for the webkit callout
-                      (Tailwind arbitrary-value syntax is used for the
-                      -webkit-* properties.)
+                      [-webkit-tap-highlight-color:transparent] - clean tap
                   */}
                   <Button
                     type="button"
                     size="sm"
-                    onClick={() => openSuccessGroup(result.successGroupUrlB64)}
+                    onClick={() => openSuccessGroup(result)}
                     aria-label={t("student.joinGroup")}
                     className="mt-3 gap-1.5 bg-emerald-600 text-white hover:bg-emerald-700 select-none [-webkit-touch-callout:none] [-webkit-tap-highlight-color:transparent] [touch-action:manipulation]"
                   >
