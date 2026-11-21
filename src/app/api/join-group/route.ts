@@ -24,8 +24,13 @@ import { readDeviceFingerprint } from "@/lib/exam/fingerprint";
  * returns a tiny interstitial page that first tries the native Telegram deep
  * link (tg://join?invite=... for invite links, tg://resolve?domain=... for
  * public usernames), so the phone opens the Telegram app directly on the
- * group. If the app does not open within a short timeout (desktop browser,
- * app not installed), the page falls back to the regular https://t.me/ URL.
+ * group.
+ *
+ * The page NEVER auto-navigates to the https://t.me/ URL. A timed fallback
+ * fires while Android shows the system "Continue to Telegram?" dialog (the
+ * tab stays visible during it), landing the user on the copyable t.me web
+ * page, and the same happens inside an installed home-screen PWA. The https
+ * URL is only reachable behind an explicit tap on a clearly secondary link.
  *
  * Both URLs only exist in this post-validation response. Nothing reachable
  * before validation (page data, React props, the result API response, the
@@ -142,8 +147,8 @@ export async function GET(request: Request) {
  * Invite links (https://t.me/+HASH or https://t.me/joinchat/HASH) map to
  * tg://join?invite=HASH. Public groups (https://t.me/USERNAME) map to
  * tg://resolve?domain=USERNAME. Returns null when the URL is not a
- * recognizable t.me link, in which case the interstitial falls back to the
- * plain https URL immediately.
+ * recognizable t.me link, in which case the interstitial's primary button
+ * points at the plain https URL (still only behind an explicit tap).
  */
 function buildTelegramDeepLink(url: string): string | null {
   try {
@@ -167,13 +172,26 @@ function buildTelegramDeepLink(url: string): string | null {
 }
 
 /**
- * Tiny interstitial page: try the native app first, fall back to the https
- * URL when the app does not take over. Reached only after full server-side
- * validation, and only ever in a top-level tab the user opened by pressing
- * the join button.
+ * Tiny interstitial page: try the native app automatically, and NEVER
+ * auto-navigate to the https URL.
+ *
+ * The tg:// deep link is attempted once on load (inside an installed
+ * home-screen PWA the OS still hands tg:// off to the Telegram app). If the
+ * app does not take over, the page reveals manual options instead of
+ * redirecting: a primary button that re-attempts the deep link (a real user
+ * gesture, which also satisfies browsers that block scripted custom-scheme
+ * navigation) and a small, clearly secondary link to the https invite URL
+ * that only navigates when tapped.
+ *
+ * Reached only after full server-side validation, and only ever in a
+ * top-level tab the user opened by pressing the join button.
  */
 function telegramHandoffResponse(httpsUrl: string, deepLink: string | null): NextResponse {
-  const fallbackDelayMs = deepLink ? 1500 : 0;
+  const primaryHref = deepLink ?? httpsUrl;
+  const primaryLabel = deepLink ? "افتح تليجرام" : "افتح رابط الانضمام";
+  const secondaryLink = deepLink
+    ? `<a class="secondary" href="${httpsUrl}">مش عندك تليجرام؟ افتح من المتصفح</a>`
+    : "";
   const html = `<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -184,27 +202,38 @@ function telegramHandoffResponse(httpsUrl: string, deepLink: string | null): Nex
 <style>
   body { font-family: system-ui, sans-serif; display: flex; min-height: 100vh; margin: 0; align-items: center; justify-content: center; background: #f4f7fb; color: #1f2933; text-align: center; }
   .card { padding: 2rem; }
-  a.btn { display: inline-block; margin-top: 1rem; padding: 0.75rem 1.5rem; border-radius: 0.75rem; background: #229ed9; color: #fff; text-decoration: none; font-weight: 600; }
+  .manual { margin-top: 1rem; }
+  .hint { margin: 0 0 0.5rem; color: #52606d; font-size: 0.95rem; }
+  a.btn { display: inline-block; margin: 0.5rem 0 1rem; padding: 0.75rem 1.5rem; border-radius: 0.75rem; background: #229ed9; color: #fff; text-decoration: none; font-weight: 600; }
+  a.secondary { display: inline-block; color: #52606d; font-size: 0.85rem; text-decoration: underline; }
 </style>
 </head>
 <body>
 <div class="card">
   <p>جاري فتح تليجرام…</p>
-  <p>لو ما اتفتحش التطبيق تلقائي، <a class="btn" href="${httpsUrl}">اضغط هنا للانضمام</a></p>
+  <div id="manual" class="manual" hidden>
+    <p class="hint">لو التطبيق ما اتفتحش، اضغط الزرار ده:</p>
+    <a class="btn" href="${primaryHref}">${primaryLabel}</a>
+    <br />
+    ${secondaryLink}
+  </div>
 </div>
 <script>
   (function () {
     var deepLink = ${JSON.stringify(deepLink)};
-    var httpsUrl = ${JSON.stringify(httpsUrl)};
+    function showManual() {
+      var m = document.getElementById("manual");
+      if (m) { m.hidden = false; }
+    }
     if (deepLink) {
+      // Attempt the native app automatically. The https URL is never
+      // assigned from a timer or any other scripted path: only a real tap
+      // on the links above may open it.
       window.location.href = deepLink;
-      // Only fall back to the https URL when the app did not take over
-      // (when Telegram opens, this tab goes to the background).
-      setTimeout(function () {
-        if (!document.hidden) { window.location.href = httpsUrl; }
-      }, ${fallbackDelayMs});
+      // If the app did not take over, reveal the manual options.
+      setTimeout(showManual, 1500);
     } else {
-      window.location.replace(httpsUrl);
+      showManual();
     }
   })();
 </script>
